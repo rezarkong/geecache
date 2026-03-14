@@ -35,13 +35,14 @@ func (lru *LRU) OnRemove(key string) {
 	}
 }
 
+func (lru *LRU) OnEvict(key string) {
+	lru.OnRemove(key)
+}
+
 func (lru *LRU) Evict() string {
 	ele := lru.ll.Back()
 	if ele == nil {
 		return ""
 	}
-	key := ele.Value.(string)
-	lru.ll.Remove(ele)
-	delete(lru.nodes, key)
-	return key
+	return ele.Value.(string)
 }

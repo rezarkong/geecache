@@ -1,9 +1,10 @@
-package geecache
+package geecache_test
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"geecache"
 	pb "geecache/geecachepb"
 	"net"
 	"reflect"
@@ -13,11 +14,11 @@ import (
 	"google.golang.org/grpc"
 )
 
-func startTestGRPCServer(t *testing.T, groupName string, getter Getter) (string, func()) {
+func startTestGRPCServer(t *testing.T, groupName string, getter geecache.Getter) (string, func()) {
 	t.Helper()
 
-	NewGroup(groupName, 2<<10, getter)
-	pool := NewGRPCPool("self")
+	geecache.NewGroup(groupName, 2<<10, getter)
+	pool := geecache.NewGRPCPool("self")
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -35,12 +36,17 @@ func startTestGRPCServer(t *testing.T, groupName string, getter Getter) (string,
 
 func TestGRPCGetterFetchesFromPeer(t *testing.T) {
 	groupName := "grpc-fetch"
-	addr, cleanup := startTestGRPCServer(t, groupName, GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+	addr, cleanup := startTestGRPCServer(t, groupName, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 		return []byte("remote-" + key), nil
 	}))
 	defer cleanup()
 
-	getter := &grpcGetter{addr: addr}
+	pool := geecache.NewGRPCPool("self")
+	pool.Set(addr)
+	getter, ok := pool.PickPeer("Tom")
+	if !ok {
+		t.Fatal("expected peer getter")
+	}
 	var out pb.Response
 	if err := getter.Get(context.Background(), &pb.Request{Group: groupName, Key: "Tom"}, &out); err != nil {
 		t.Fatalf("getter.Get: %v", err)
@@ -51,14 +57,14 @@ func TestGRPCGetterFetchesFromPeer(t *testing.T) {
 }
 
 func TestGRPCPoolPickPeerBeforeSet(t *testing.T) {
-	pool := NewGRPCPool("self")
+	pool := geecache.NewGRPCPool("self")
 	if peer, ok := pool.PickPeer("Tom"); ok || peer != nil {
 		t.Fatalf("expected no peer before Set")
 	}
 }
 
 func TestGRPCPoolPeersReflectLatestSet(t *testing.T) {
-	pool := NewGRPCPool("self")
+	pool := geecache.NewGRPCPool("self")
 	pool.Set("node1", "node2")
 	peers := pool.Peers()
 	sort.Strings(peers)
@@ -77,12 +83,17 @@ func TestGRPCPoolPeersReflectLatestSet(t *testing.T) {
 
 func TestGRPCGetterPropagatesPeerError(t *testing.T) {
 	groupName := "grpc-fetch-miss"
-	addr, cleanup := startTestGRPCServer(t, groupName, GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+	addr, cleanup := startTestGRPCServer(t, groupName, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("missing %s", key)
 	}))
 	defer cleanup()
 
-	getter := &grpcGetter{addr: addr}
+	pool := geecache.NewGRPCPool("self")
+	pool.Set(addr)
+	getter, ok := pool.PickPeer("Tom")
+	if !ok {
+		t.Fatal("expected peer getter")
+	}
 	err := getter.Get(context.Background(), &pb.Request{Group: groupName, Key: "Tom"}, &pb.Response{})
 	if err == nil {
 		t.Fatal("expected peer error")
@@ -91,20 +102,25 @@ func TestGRPCGetterPropagatesPeerError(t *testing.T) {
 
 func TestGRPCGetterReturnsNotFound(t *testing.T) {
 	groupName := "grpc-not-found"
-	addr, cleanup := startTestGRPCServer(t, groupName, GetterFunc(func(_ context.Context, _ string) ([]byte, error) {
-		return nil, ErrNotFound
+	addr, cleanup := startTestGRPCServer(t, groupName, geecache.GetterFunc(func(_ context.Context, _ string) ([]byte, error) {
+		return nil, geecache.ErrNotFound
 	}))
 	defer cleanup()
 
-	getter := &grpcGetter{addr: addr}
+	pool := geecache.NewGRPCPool("self")
+	pool.Set(addr)
+	getter, ok := pool.PickPeer("Tom")
+	if !ok {
+		t.Fatal("expected peer getter")
+	}
 	err := getter.Get(context.Background(), &pb.Request{Group: groupName, Key: "Tom"}, &pb.Response{})
-	if err != ErrNotFound {
+	if err != geecache.ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
 
 func TestStatsJSONShape(t *testing.T) {
-	group := NewGroup("json-stats", 2<<10, GetterFunc(func(_ context.Context, _ string) ([]byte, error) {
+	group := geecache.NewGroup("json-stats", 2<<10, geecache.GetterFunc(func(_ context.Context, _ string) ([]byte, error) {
 		return []byte("v"), nil
 	}))
 	if _, err := group.Get("Tom"); err != nil {

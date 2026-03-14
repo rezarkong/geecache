@@ -23,19 +23,27 @@ var db = map[string]string{
 	"Sam":  "567",
 }
 
+func evictorFactory(name string) func() algo.Evictor {
+	switch strings.ToLower(name) {
+	case "lfu":
+		return func() algo.Evictor { return algo.NewLFU() }
+	case "lru-k", "lruk":
+		return func() algo.Evictor { return algo.NewLRUK(2) }
+	case "arc":
+		return func() algo.Evictor { return algo.NewARC() }
+	default:
+		return func() algo.Evictor { return algo.NewLRU() }
+	}
+}
+
 func createGroup(emptyTTL time.Duration, peerRetries int, evictor string) *geecache.Group {
 	opts := []geecache.Option{
 		geecache.WithCacheTTL(2*time.Minute, 15*time.Second),
 		geecache.WithEmptyCache(emptyTTL),
 		geecache.WithPeerRetries(peerRetries),
-		geecache.WithPeerRetryBackoff(100*time.Millisecond),
+		geecache.WithPeerRetryBackoff(100 * time.Millisecond),
 		geecache.WithPeerCircuitBreaker(3, 3*time.Second),
-	}
-	switch evictor {
-	case "lfu":
-		opts = append(opts, geecache.WithEvictor(func() algo.Evictor { return algo.NewLFU() }))
-	default:
-		opts = append(opts, geecache.WithEvictor(func() algo.Evictor { return algo.NewLRU() }))
+		geecache.WithEvictor(evictorFactory(evictor)),
 	}
 
 	return geecache.NewGroupWithOptions(
@@ -150,7 +158,7 @@ func main() {
 	flag.StringVar(&apiAddr, "api-addr", "localhost:9999", "API server listen address")
 	flag.DurationVar(&emptyTTL, "empty-ttl", 30*time.Second, "TTL for not-found cache entries")
 	flag.IntVar(&peerRetries, "peer-retries", 1, "Number of peer retries before local fallback")
-	flag.StringVar(&evictor, "evictor", "lru", "Cache eviction algorithm: lru or lfu")
+	flag.StringVar(&evictor, "evictor", "lru", "Cache eviction algorithm: lru, lfu, lru-k, or arc")
 	flag.Parse()
 
 	peerList := splitPeers(peers)

@@ -23,7 +23,7 @@ func NewLFU() *LFU {
 
 func (lfu *LFU) OnAdd(key string) {
 	if node, ok := lfu.nodes[key]; ok {
-		lfu.bump(node)
+		lfu.bump(node) // 往后面挪
 		return
 	}
 	bucket := lfu.bucket(1)
@@ -49,6 +49,10 @@ func (lfu *LFU) OnRemove(key string) {
 	lfu.removeNode(node)
 }
 
+func (lfu *LFU) OnEvict(key string) {
+	lfu.OnRemove(key)
+}
+
 func (lfu *LFU) Evict() string {
 	if lfu.minFreq == 0 {
 		return ""
@@ -61,9 +65,7 @@ func (lfu *LFU) Evict() string {
 	if ele == nil {
 		return ""
 	}
-	node := ele.Value.(*lfuNode)
-	lfu.removeNode(node)
-	return node.key
+	return ele.Value.(*lfuNode).key
 }
 
 func (lfu *LFU) bump(node *lfuNode) {

@@ -1,8 +1,9 @@
-package geecache
+package geecache_test
 
 import (
 	"context"
 	"fmt"
+	"geecache"
 	"geecache/algo"
 	pb "geecache/geecachepb"
 	"io"
@@ -23,7 +24,7 @@ var db = map[string]string{
 
 type failingPeerPicker struct{}
 
-func (failingPeerPicker) PickPeer(string) (PeerGetter, bool) {
+func (failingPeerPicker) PickPeer(string) (geecache.PeerGetter, bool) {
 	return failingPeerGetter{}, true
 }
 
@@ -34,10 +35,10 @@ func (failingPeerGetter) Get(context.Context, *pb.Request, *pb.Response) error {
 }
 
 type flakyPeerPicker struct {
-	getter PeerGetter
+	getter geecache.PeerGetter
 }
 
-func (p flakyPeerPicker) PickPeer(string) (PeerGetter, bool) {
+func (p flakyPeerPicker) PickPeer(string) (geecache.PeerGetter, bool) {
 	return p.getter, true
 }
 
@@ -77,11 +78,11 @@ type notFoundPeerGetter struct {
 
 func (g *notFoundPeerGetter) Get(context.Context, *pb.Request, *pb.Response) error {
 	atomic.AddInt32(&g.calls, 1)
-	return ErrNotFound
+	return geecache.ErrNotFound
 }
 
 func TestGetter(t *testing.T) {
-	var f Getter = GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+	var f geecache.Getter = geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 		return []byte(key), nil
 	})
 
@@ -93,7 +94,7 @@ func TestGetter(t *testing.T) {
 
 func TestGet(t *testing.T) {
 	loadCounts := make(map[string]int, len(db))
-	gee := NewGroup("scores", 2<<10, GetterFunc(
+	gee := geecache.NewGroup("scores", 2<<10, geecache.GetterFunc(
 		func(_ context.Context, key string) ([]byte, error) {
 			log.Println("[SlowDB] search key", key)
 			if v, ok := db[key]; ok {
@@ -122,20 +123,20 @@ func TestGet(t *testing.T) {
 
 func TestGetGroup(t *testing.T) {
 	groupName := "scores"
-	NewGroup(groupName, 2<<10, GetterFunc(
+	geecache.NewGroup(groupName, 2<<10, geecache.GetterFunc(
 		func(_ context.Context, _ string) (bytes []byte, err error) { return }))
-	if group := GetGroup(groupName); group == nil || group.name != groupName {
+	if group := geecache.GetGroup(groupName); group == nil {
 		t.Fatalf("group %s not exist", groupName)
 	}
 
-	if group := GetGroup(groupName + "111"); group != nil {
-		t.Fatalf("expect nil, but %s got", group.name)
+	if group := geecache.GetGroup(groupName + "111"); group != nil {
+		t.Fatalf("expect nil, but got non-nil group")
 	}
 }
 
 func TestGetFallsBackOnPeerFailure(t *testing.T) {
 	var loads int32
-	gee := NewGroup("peer-fallback", 2<<10, GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+	gee := geecache.NewGroup("peer-fallback", 2<<10, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&loads, 1)
 		return []byte("local-" + key), nil
 	}))
@@ -157,7 +158,7 @@ func TestGetSingleflight(t *testing.T) {
 	const goroutines = 20
 
 	var loads int32
-	gee := NewGroup("singleflight", 2<<10, GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+	gee := geecache.NewGroup("singleflight", 2<<10, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&loads, 1)
 		time.Sleep(10 * time.Millisecond)
 		return []byte("value-" + key), nil
@@ -194,20 +195,72 @@ func TestGetSingleflight(t *testing.T) {
 	}
 }
 
+func TestGetContextSingleflightDoesNotShareCallerCancellation(t *testing.T) {
+	var loads int32
+	gee := geecache.NewGroup("singleflight-context", 2<<10, geecache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&loads, 1)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(30 * time.Millisecond):
+			return []byte("value-" + key), nil
+		}
+	}))
+
+	firstCtx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+
+	type result struct {
+		view geecache.ByteView
+		err  error
+	}
+
+	firstResult := make(chan result, 1)
+	secondResult := make(chan result, 1)
+
+	go func() {
+		view, err := gee.GetContext(firstCtx, "Tom")
+		firstResult <- result{view: view, err: err}
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+
+	go func() {
+		view, err := gee.GetContext(context.Background(), "Tom")
+		secondResult <- result{view: view, err: err}
+	}()
+
+	first := <-firstResult
+	if first.err != context.DeadlineExceeded {
+		t.Fatalf("expected first caller to fail with deadline exceeded, got value=%q err=%v", first.view.String(), first.err)
+	}
+
+	second := <-secondResult
+	if second.err != nil {
+		t.Fatalf("expected second caller to succeed, got %v", second.err)
+	}
+	if got := second.view.String(); got != "value-Tom" {
+		t.Fatalf("unexpected value %q", got)
+	}
+	if got := atomic.LoadInt32(&loads); got != 1 {
+		t.Fatalf("expected one shared load, got %d", got)
+	}
+}
+
 func TestGetCachesNotFoundWhenEnabled(t *testing.T) {
 	var loads int32
-	gee := NewGroupWithOptions(
+	gee := geecache.NewGroupWithOptions(
 		"empty-cache",
 		2<<10,
-		GetterFunc(func(_ context.Context, _ string) ([]byte, error) {
+		geecache.GetterFunc(func(_ context.Context, _ string) ([]byte, error) {
 			atomic.AddInt32(&loads, 1)
-			return nil, ErrNotFound
+			return nil, geecache.ErrNotFound
 		}),
-		WithEmptyCache(30*time.Millisecond),
+		geecache.WithEmptyCache(30*time.Millisecond),
 	)
 
 	for i := 0; i < 2; i++ {
-		if _, err := gee.Get("missing"); err != ErrNotFound {
+		if _, err := gee.Get("missing"); err != geecache.ErrNotFound {
 			t.Fatalf("expected ErrNotFound, got %v", err)
 		}
 	}
@@ -221,7 +274,7 @@ func TestGetCachesNotFoundWhenEnabled(t *testing.T) {
 	}
 
 	time.Sleep(40 * time.Millisecond)
-	if _, err := gee.Get("missing"); err != ErrNotFound {
+	if _, err := gee.Get("missing"); err != geecache.ErrNotFound {
 		t.Fatalf("expected ErrNotFound after ttl, got %v", err)
 	}
 	if got := atomic.LoadInt32(&loads); got != 2 {
@@ -232,14 +285,14 @@ func TestGetCachesNotFoundWhenEnabled(t *testing.T) {
 func TestGetRetriesPeerBeforeLocalFallback(t *testing.T) {
 	peer := &flakyPeerGetter{failuresLeft: 1}
 	var localLoads int32
-	gee := NewGroupWithOptions(
+	gee := geecache.NewGroupWithOptions(
 		"peer-retry",
 		2<<10,
-		GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 			atomic.AddInt32(&localLoads, 1)
 			return []byte("local-" + key), nil
 		}),
-		WithPeerRetries(2),
+		geecache.WithPeerRetries(2),
 	)
 	gee.RegisterPeers(flakyPeerPicker{getter: peer})
 
@@ -261,21 +314,57 @@ func TestGetRetriesPeerBeforeLocalFallback(t *testing.T) {
 	}
 }
 
-func TestPeerNotFoundDoesNotFallbackLocally(t *testing.T) {
-	peer := &notFoundPeerGetter{}
-	var localLoads int32
-	gee := NewGroupWithOptions(
-		"peer-not-found",
+func TestGetContextPeerRetryBackoffStopsOnCancellation(t *testing.T) {
+	peer := &alwaysFailPeerGetter{err: timeoutNetError{}}
+	gee := geecache.NewGroupWithOptions(
+		"peer-retry-cancel",
 		2<<10,
-		GetterFunc(func(_ context.Context, key string) ([]byte, error) {
-			atomic.AddInt32(&localLoads, 1)
-			return []byte("local-" + key), nil
+		geecache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+				return []byte("local-" + key), nil
+			}
 		}),
-		WithEmptyCache(30*time.Millisecond),
+		geecache.WithPeerRetries(3),
+		geecache.WithPeerRetryBackoff(200*time.Millisecond),
 	)
 	gee.RegisterPeers(flakyPeerPicker{getter: peer})
 
-	if _, err := gee.Get("Tom"); err != ErrNotFound {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := gee.GetContext(ctx, "Tom")
+	elapsed := time.Since(start)
+
+	if err != context.DeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	if elapsed >= 150*time.Millisecond {
+		t.Fatalf("expected cancellation to stop retry backoff quickly, took %s", elapsed)
+	}
+	if got := atomic.LoadInt32(&peer.calls); got != 1 {
+		t.Fatalf("expected retry loop to stop during first backoff, got %d peer calls", got)
+	}
+}
+
+func TestPeerNotFoundDoesNotFallbackLocally(t *testing.T) {
+	peer := &notFoundPeerGetter{}
+	var localLoads int32
+	gee := geecache.NewGroupWithOptions(
+		"peer-not-found",
+		2<<10,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			atomic.AddInt32(&localLoads, 1)
+			return []byte("local-" + key), nil
+		}),
+		geecache.WithEmptyCache(30*time.Millisecond),
+	)
+	gee.RegisterPeers(flakyPeerPicker{getter: peer})
+
+	if _, err := gee.Get("Tom"); err != geecache.ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 	if got := atomic.LoadInt32(&localLoads); got != 0 {
@@ -286,7 +375,7 @@ func TestPeerNotFoundDoesNotFallbackLocally(t *testing.T) {
 		t.Fatalf("unexpected stats after peer not found: %+v", stats)
 	}
 
-	if _, err := gee.Get("Tom"); err != ErrNotFound {
+	if _, err := gee.Get("Tom"); err != geecache.ErrNotFound {
 		t.Fatalf("expected cached ErrNotFound, got %v", err)
 	}
 	if got := atomic.LoadInt32(&peer.calls); got != 1 {
@@ -296,14 +385,14 @@ func TestPeerNotFoundDoesNotFallbackLocally(t *testing.T) {
 
 func TestGetUsesPositiveCacheTTL(t *testing.T) {
 	var loads int32
-	gee := NewGroupWithOptions(
+	gee := geecache.NewGroupWithOptions(
 		"positive-ttl",
 		2<<10,
-		GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 			atomic.AddInt32(&loads, 1)
 			return []byte("value-" + key), nil
 		}),
-		WithCacheTTL(25*time.Millisecond, 0),
+		geecache.WithCacheTTL(25*time.Millisecond, 0),
 	)
 
 	if _, err := gee.Get("Tom"); err != nil {
@@ -331,15 +420,15 @@ func TestGetUsesPositiveCacheTTL(t *testing.T) {
 func TestPeerCircuitBreakerOpens(t *testing.T) {
 	peer := &alwaysFailPeerGetter{err: timeoutNetError{}}
 	var localLoads int32
-	gee := NewGroupWithOptions(
+	gee := geecache.NewGroupWithOptions(
 		"peer-circuit",
 		2<<10,
-		GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 			atomic.AddInt32(&localLoads, 1)
 			return []byte("local-" + key), nil
 		}),
-		WithPeerRetries(0),
-		WithPeerCircuitBreaker(2, 50*time.Millisecond),
+		geecache.WithPeerRetries(0),
+		geecache.WithPeerCircuitBreaker(2, 50*time.Millisecond),
 	)
 	gee.RegisterPeers(flakyPeerPicker{getter: peer})
 
@@ -362,10 +451,10 @@ func TestPeerCircuitBreakerOpens(t *testing.T) {
 }
 
 func TestStatsTrackDurations(t *testing.T) {
-	gee := NewGroupWithOptions(
+	gee := geecache.NewGroupWithOptions(
 		"stats-duration",
 		2<<10,
-		GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 			time.Sleep(5 * time.Millisecond)
 			return []byte("value-" + key), nil
 		}),
@@ -388,14 +477,14 @@ func TestStatsTrackDurations(t *testing.T) {
 
 func TestWithEvictorUsesConfiguredAlgorithm(t *testing.T) {
 	var loads int32
-	gee := NewGroupWithOptions(
+	gee := geecache.NewGroupWithOptions(
 		"lfu-evictor",
 		int64(len("a")+len("1")+len("b")+len("2")),
-		GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 			atomic.AddInt32(&loads, 1)
 			return []byte(key), nil
 		}),
-		WithEvictor(func() algo.Evictor { return algo.NewLFU() }),
+		geecache.WithEvictor(func() algo.Evictor { return algo.NewLFU() }),
 	)
 
 	if _, err := gee.Get("a"); err != nil {
@@ -427,10 +516,10 @@ func silenceLogs() func() {
 	}
 }
 
-func benchmarkGroup(b *testing.B, name string) *Group {
+func benchmarkGroup(b *testing.B, name string) *geecache.Group {
 	b.Helper()
 
-	return NewGroupWithOptions(name, 2<<10, GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+	return geecache.NewGroupWithOptions(name, 2<<10, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 		return []byte("value-" + key), nil
 	}), benchmarkEvictorOption(b))
 }
@@ -483,10 +572,10 @@ func BenchmarkGroupGetMixedWorkload(b *testing.B) {
 
 	cacheBytes := int64(cacheEntries * (len("c000") + valueLen))
 	var loads int64
-	gee := NewGroupWithOptions(
+	gee := geecache.NewGroupWithOptions(
 		"benchmark-mixed",
 		cacheBytes,
-		GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
 			atomic.AddInt64(&loads, 1)
 			return []byte("v"), nil
 		}),
@@ -523,14 +612,18 @@ func BenchmarkGroupGetMixedWorkload(b *testing.B) {
 	b.ReportMetric(missRatio, "miss_ratio")
 }
 
-func benchmarkEvictorOption(b *testing.B) Option {
+func benchmarkEvictorOption(b *testing.B) geecache.Option {
 	b.Helper()
 
 	switch evictor := os.Getenv("BENCH_EVICTOR"); evictor {
 	case "", "lru":
-		return WithEvictor(func() algo.Evictor { return algo.NewLRU() })
+		return geecache.WithEvictor(func() algo.Evictor { return algo.NewLRU() })
 	case "lfu":
-		return WithEvictor(func() algo.Evictor { return algo.NewLFU() })
+		return geecache.WithEvictor(func() algo.Evictor { return algo.NewLFU() })
+	case "lru-k", "lruk":
+		return geecache.WithEvictor(func() algo.Evictor { return algo.NewLRUK(2) })
+	case "arc":
+		return geecache.WithEvictor(func() algo.Evictor { return algo.NewARC() })
 	default:
 		b.Fatalf("unsupported BENCH_EVICTOR %q", evictor)
 		return nil

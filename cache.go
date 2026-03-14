@@ -7,7 +7,7 @@ import (
 )
 
 type cache struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	store      *algo.Cache
 	cacheBytes int64
 	onExpire   func()
@@ -29,25 +29,19 @@ func (e cacheEntry) expired(now time.Time) bool {
 }
 
 func (c *cache) add(key string, entry cacheEntry) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.store == nil {
-		c.store = algo.New(c.cacheBytes, c.evictor(), nil)
-	}
-	c.store.Add(key, entry)
+	c.ensureStore().Add(key, entry)
 }
 
 func (c *cache) get(key string) (entry cacheEntry, ok bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.store == nil {
+	store := c.getStore()
+	if store == nil {
 		return
 	}
 
-	if v, ok := c.store.Get(key); ok {
+	if v, ok := store.Get(key); ok {
 		entry = v.(cacheEntry)
 		if entry.expired(time.Now()) {
-			c.store.Remove(key)
+			store.Remove(key)
 			if c.onExpire != nil {
 				c.onExpire()
 			}
@@ -64,4 +58,23 @@ func (c *cache) evictor() algo.Evictor {
 		return c.newEvictor()
 	}
 	return algo.NewLRU()
+}
+
+func (c *cache) getStore() *algo.Cache {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.store
+}
+
+func (c *cache) ensureStore() *algo.Cache {
+	if store := c.getStore(); store != nil {
+		return store
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.store == nil {
+		c.store = algo.New(c.cacheBytes, c.evictor(), nil)
+	}
+	return c.store
 }

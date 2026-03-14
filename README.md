@@ -2,7 +2,7 @@
 
 `GeeCache` 是一个使用 Go 实现的分布式缓存原型项目。在基础版本之上，这个仓库已经补充了更完整的工程能力，包括：
 
-- LRU 本地缓存淘汰
+- LRU/LFU/LRU-K/ARC 本地缓存淘汰
 - 基于一致性哈希的节点路由
 - 使用 `singleflight` 抑制热点 key 并发回源
 - 基于 gRPC + Protobuf 的节点间通信
@@ -18,7 +18,7 @@
 
 请求处理流程：
 
-1. `Group.Get(key)` 先查询本地 LRU 缓存。
+1. `Group.Get(key)` 先查询本地缓存。
 2. 本地未命中时，通过 `singleflight` 合并同一个 key 的并发请求。
 3. 如果一致性哈希判断该 key 属于远端节点，则通过 gRPC + Protobuf 拉取数据，并传递请求上下文。
 4. 远端 peer 获取失败时，会按配置执行超时控制、重试退避和熔断判断。
@@ -33,12 +33,50 @@
 - `cache.go`：本地缓存封装、TTL 和空值缓存过期逻辑
 - `stats.go`：运行时指标统计与快照输出
 - `options.go`：缓存 TTL、peer 重试、熔断等配置项
-- `algo/`：可插拔淘汰算法实现，目前包含 LRU 和 LFU
+- `algo/`：可插拔淘汰算法实现，目前包含 LRU、LFU、LRU-K 和 ARC
 - `cmd/server/main.go`：可运行多节点 demo，包含 `/api`、`/metrics` 和 `/admin/peers`
+
+## 已实现能力
+
+库级接口：
+
+- `NewGroup` / `NewGroupWithOptions`：创建缓存组
+- `Get` / `GetContext`：读取缓存，支持显式传入 `context.Context`
+- `RegisterPeers`：注册 peer 选择器
+- `Stats`：导出运行时指标快照
+
+可选项：
+
+- `WithEvictor`：切换 LRU / LFU / LRU-K / ARC
+- `WithCacheTTL`：设置正常缓存项 TTL 和过期抖动
+- `WithEmptyCache`：开启 missing key 空值缓存
+- `WithPeerRetries`：配置 peer 重试次数
+- `WithPeerRetryBackoff`：配置重试退避
+- `WithPeerCircuitBreaker`：配置熔断阈值和打开时长
+
+Demo 服务提供的接口：
+
+- `GET /api?key=<key>`：读取缓存值
+- `GET /metrics`：输出 JSON 指标
+- `GET /admin/peers`：查看当前 peer 列表
+- `POST /admin/peers`：动态更新 peer 列表
 
 ## 运行 Demo
 
-分别在 3 个终端启动缓存节点：
+环境要求：
+
+- Go 1.24+
+- 本机可监听 `localhost:8001`、`localhost:8002`、`localhost:8003`、`localhost:9999`
+
+如果只跑纯 gRPC cache 节点，可以拉起 3 个节点：
+
+```bash
+make demo-node1
+make demo-node2
+make demo-node3
+```
+
+等价的原始命令：
 
 ```bash
 go run ./cmd/server -addr=localhost:8001 -peers=localhost:8001,localhost:8002,localhost:8003
@@ -46,7 +84,37 @@ go run ./cmd/server -addr=localhost:8002 -peers=localhost:8001,localhost:8002,lo
 go run ./cmd/server -addr=localhost:8003 -peers=localhost:8001,localhost:8002,localhost:8003
 ```
 
-在其中一个节点上启动 API 和指标接口：
+如果希望 `8001` 同时暴露 HTTP API 和指标接口，不要再单独启动 `demo-node1`。应当启动这一组：
+
+```bash
+make demo-node2
+make demo-node3
+make demo-api
+```
+
+其中 `demo-api` 会占用 `localhost:8001`，它本身就是第一个 cache 节点。
+
+等价命令：
+
+```bash
+go run ./cmd/server -addr=localhost:8002 -peers=localhost:8001,localhost:8002,localhost:8003
+go run ./cmd/server -addr=localhost:8003 -peers=localhost:8001,localhost:8002,localhost:8003
+go run ./cmd/server \
+  -addr=localhost:8001 \
+  -peers=localhost:8001,localhost:8002,localhost:8003 \
+  -api=true \
+  -api-addr=localhost:9999 \
+  -empty-ttl=30s \
+  -peer-retries=1
+```
+
+如果只想单独看 `demo-api` 的原始启动命令：
+
+```bash
+make demo-api
+```
+
+对应命令：
 
 ```bash
 go run ./cmd/server \
@@ -58,7 +126,21 @@ go run ./cmd/server \
   -peer-retries=1
 ```
 
-切换成 LFU：
+如果要切换成 LFU，同样不要再启动 `demo-node1`。应当启动：
+
+```bash
+make demo-node2
+make demo-node3
+make demo-api-lfu
+```
+
+对应的 API 节点命令：
+
+```bash
+make demo-api-lfu
+```
+
+对应命令：
 
 ```bash
 go run ./cmd/server \
@@ -77,6 +159,18 @@ curl "http://localhost:9999/api?key=unknown"
 curl "http://localhost:9999/metrics"
 curl "http://localhost:9999/admin/peers"
 ```
+
+支持的启动参数：
+
+| Flag | 默认值 | 说明 |
+| --- | --- | --- |
+| `-addr` | `localhost:8001` | 当前 gRPC cache 节点地址 |
+| `-peers` | `localhost:8001,localhost:8002,localhost:8003` | 初始 peer 列表 |
+| `-api` | `false` | 是否同时启动 HTTP API |
+| `-api-addr` | `localhost:9999` | HTTP API 监听地址 |
+| `-empty-ttl` | `30s` | 空值缓存 TTL |
+| `-peer-retries` | `1` | peer 失败后的重试次数 |
+| `-evictor` | `lru` | 淘汰算法，支持 `lru` / `lfu` / `lru-k` / `arc` |
 
 运行时更新 peer 列表：
 
@@ -98,6 +192,13 @@ make test
 make race
 ```
 
+按包执行时，当前测试主要分布在：
+
+- `./test/algo`
+- `./test/consistenthash`
+- `./test/geecache`
+- `./test/singleflight`
+
 当前覆盖的重点场景：
 
 - 本地缓存命中与未命中
@@ -114,15 +215,13 @@ make race
 
 ## 性能测试
 
-运行本地 benchmark：
+当前 benchmark 实现在 `./test/geecache` 包下，根目录直接执行 `go test -bench . -benchmem` 不会跑到这些用例。请使用下面这些命令：
 
 ```bash
-go test -bench . -benchmem
-BENCH_EVICTOR=lru go test -bench . -benchmem
-BENCH_EVICTOR=lfu go test -bench . -benchmem
-make bench
-make bench-lru
-make bench-lfu
+go test ./test/geecache -run '^$' -bench . -benchmem
+BENCH_EVICTOR=lru go test ./test/geecache -run '^$' -bench . -benchmem
+BENCH_EVICTOR=lfu go test ./test/geecache -run '^$' -bench . -benchmem
+go test ./test/geecache -run '^$' -bench BenchmarkGroupGetMixedWorkload -benchmem
 ```
 
 当前机器在 2026 年 3 月 12 日的参考结果：
@@ -143,3 +242,5 @@ make bench-lfu
 make loadtest-hot
 make loadtest-miss
 ```
+
+`scripts/loadtest.sh` 会优先使用 `hey`；如果本机没有安装 `hey`，会退化为串行 `curl` 循环。

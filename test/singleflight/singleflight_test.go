@@ -1,6 +1,7 @@
-package singleflight
+package singleflight_test
 
 import (
+	"geecache/singleflight"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -8,7 +9,7 @@ import (
 )
 
 func TestDo(t *testing.T) {
-	var g Group
+	var g singleflight.Group
 	v, err := g.Do("key", func() (interface{}, error) {
 		return "bar", nil
 	})
@@ -19,7 +20,7 @@ func TestDo(t *testing.T) {
 }
 
 func TestDoSuppressesDuplicateCalls(t *testing.T) {
-	var g Group
+	var g singleflight.Group
 	var calls int32
 	var wg sync.WaitGroup
 	start := make(chan struct{})

@@ -1,17 +1,22 @@
 package algo
 
+import "sync"
+
 // Evictor controls which key should be evicted next.
 // Cache owns the actual values; the evictor only tracks access patterns.
+// Evict returns a victim key but must not mutate internal state.
 type Evictor interface {
 	OnAdd(key string)
 	OnAccess(key string)
 	OnRemove(key string)
+	OnEvict(key string)
 	Evict() string
 }
 
 type Cache struct {
 	maxBytes  int64
 	nbytes    int64
+	mu        sync.RWMutex
 	cache     map[string]Value
 	evictor   Evictor
 	onEvicted func(key string, value Value)
@@ -35,6 +40,8 @@ func New(maxBytes int64, evictor Evictor, onEvicted func(key string, value Value
 }
 
 func (c *Cache) Add(key string, value Value) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if existing, ok := c.cache[key]; ok {
 		c.nbytes += int64(value.Len()) - int64(existing.Len())
 		c.cache[key] = value
@@ -44,13 +51,14 @@ func (c *Cache) Add(key string, value Value) {
 		c.nbytes += int64(len(key)) + int64(value.Len())
 		c.evictor.OnAdd(key)
 	}
-
 	for c.maxBytes != 0 && c.maxBytes < c.nbytes {
 		c.removeOldest()
 	}
 }
 
 func (c *Cache) Get(key string) (value Value, ok bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if value, ok = c.cache[key]; ok {
 		c.evictor.OnAccess(key)
 		return value, true
@@ -59,6 +67,26 @@ func (c *Cache) Get(key string) (value Value, ok bool) {
 }
 
 func (c *Cache) Remove(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.removeKey(key)
+}
+
+func (c *Cache) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.cache)
+}
+
+func (c *Cache) removeOldest() {
+	key := c.evictor.Evict()
+	if key == "" {
+		return
+	}
+	c.evictKey(key)
+}
+
+func (c *Cache) removeKey(key string) {
 	value, ok := c.cache[key]
 	if !ok {
 		return
@@ -71,20 +99,13 @@ func (c *Cache) Remove(key string) {
 	}
 }
 
-func (c *Cache) Len() int {
-	return len(c.cache)
-}
-
-func (c *Cache) removeOldest() {
-	key := c.evictor.Evict()
-	if key == "" {
-		return
-	}
+func (c *Cache) evictKey(key string) {
 	value, ok := c.cache[key]
 	if !ok {
 		return
 	}
 	delete(c.cache, key)
+	c.evictor.OnEvict(key)
 	c.nbytes -= int64(len(key)) + int64(value.Len())
 	if c.onEvicted != nil {
 		c.onEvicted(key, value)

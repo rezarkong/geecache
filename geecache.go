@@ -144,7 +144,8 @@ func (g *Group) Stats() StatsSnapshot {
 func (g *Group) load(ctx context.Context, key string) (value ByteView, err error) {
 	// each key is only fetched once (either locally or remotely)
 	// regardless of the number of concurrent callers.
-	viewi, err := g.loader.Do(key, func() (interface{}, error) {
+	loadCtx := context.WithoutCancel(ctx)
+	resultCh := g.loader.DoChan(key, func() (interface{}, error) {
 		if g.peers != nil {
 			if peer, ok := g.peers.PickPeer(key); ok {
 				peerID := identifyPeer(peer)
@@ -152,9 +153,9 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 					g.stats.addCircuitRejects(1)
 					g.stats.addPeerFallbacks(1)
 					log.Println("[GeeCache] Skip peer because circuit is open", peerID)
-					return g.getLocally(ctx, key)
+					return g.getLocally(loadCtx, key)
 				}
-				if value, err = g.getFromPeer(ctx, peer, key); err == nil {
+				if value, err = g.getFromPeer(loadCtx, peer, key); err == nil {
 					g.stats.addPeerLoads(1)
 					g.onPeerSuccess(peerID)
 					return value, nil
@@ -177,13 +178,17 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 			}
 		}
 
-		return g.getLocally(ctx, key)
+		return g.getLocally(loadCtx, key)
 	})
-
-	if err == nil {
-		return viewi.(ByteView), nil
+	select {
+	case <-ctx.Done():
+		return ByteView{}, ctx.Err()
+	case result := <-resultCh:
+		if result.Err == nil {
+			return result.Val.(ByteView), nil
+		}
+		return ByteView{}, result.Err
 	}
-	return
 }
 
 func (g *Group) populateCache(key string, value ByteView) {
@@ -240,7 +245,15 @@ func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (B
 		if attempt < g.peerRetries && isRetryableError(err) {
 			g.stats.addPeerRetries(1)
 			if g.peerRetryBackoff > 0 {
-				time.Sleep(time.Duration(attempt+1) * g.peerRetryBackoff)
+				timer := time.NewTimer(time.Duration(attempt+1) * g.peerRetryBackoff)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return ByteView{}, ctx.Err()
+				case <-timer.C:
+				}
 			}
 			continue
 		}
