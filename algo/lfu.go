@@ -3,34 +3,42 @@ package algo
 import "container/list"
 
 type LFU struct {
-	nodes   map[string]*lfuNode
-	freqs   map[int]*list.List
-	minFreq int
+	nodes map[string]*lfuNode
+	freqs map[int]*list.Element
+	order *list.List
 }
 
 type lfuNode struct {
 	key     string
 	freq    int
 	element *list.Element
+	bucket  *lfuBucket
+}
+
+type lfuBucket struct {
+	freq    int
+	entries *list.List
+	element *list.Element
 }
 
 func NewLFU() *LFU {
 	return &LFU{
 		nodes: make(map[string]*lfuNode),
-		freqs: make(map[int]*list.List),
+		freqs: make(map[int]*list.Element),
+		order: list.New(),
 	}
 }
 
 func (lfu *LFU) OnAdd(key string) {
 	if node, ok := lfu.nodes[key]; ok {
-		lfu.bump(node) // 往后面挪
+		lfu.bump(node)
 		return
 	}
-	bucket := lfu.bucket(1)
-	node := &lfuNode{key: key, freq: 1}
-	node.element = bucket.PushFront(node)
+
+	bucket := lfu.ensureBucket(1, lfu.order.Front())
+	node := &lfuNode{key: key, freq: 1, bucket: bucket}
+	node.element = bucket.entries.PushFront(node)
 	lfu.nodes[key] = node
-	lfu.minFreq = 1
 }
 
 func (lfu *LFU) OnAccess(key string) {
@@ -46,7 +54,8 @@ func (lfu *LFU) OnRemove(key string) {
 	if !ok {
 		return
 	}
-	lfu.removeNode(node)
+	lfu.removeFromBucket(node)
+	delete(lfu.nodes, key)
 }
 
 func (lfu *LFU) OnEvict(key string) {
@@ -54,14 +63,13 @@ func (lfu *LFU) OnEvict(key string) {
 }
 
 func (lfu *LFU) Evict() string {
-	if lfu.minFreq == 0 {
+	front := lfu.order.Front()
+	if front == nil {
 		return ""
 	}
-	bucket := lfu.freqs[lfu.minFreq]
-	if bucket == nil {
-		return ""
-	}
-	ele := bucket.Back()
+
+	bucket := front.Value.(*lfuBucket)
+	ele := bucket.entries.Back()
 	if ele == nil {
 		return ""
 	}
@@ -69,49 +77,47 @@ func (lfu *LFU) Evict() string {
 }
 
 func (lfu *LFU) bump(node *lfuNode) {
-	oldFreq := node.freq
-	oldBucket := lfu.freqs[oldFreq]
-	oldBucket.Remove(node.element)
-	if oldBucket.Len() == 0 {
-		delete(lfu.freqs, oldFreq)
-		if lfu.minFreq == oldFreq {
-			lfu.minFreq++
-		}
-	}
+	current := node.bucket
+	nextElem := current.element.Next()
+
+	lfu.removeFromBucket(node)
 
 	node.freq++
-	newBucket := lfu.bucket(node.freq)
-	node.element = newBucket.PushFront(node)
+	nextBucket := lfu.ensureBucket(node.freq, nextElem)
+	node.bucket = nextBucket
+	node.element = nextBucket.entries.PushFront(node)
 }
 
-func (lfu *LFU) removeNode(node *lfuNode) {
-	bucket := lfu.freqs[node.freq]
-	if bucket != nil {
-		bucket.Remove(node.element)
-		if bucket.Len() == 0 {
-			delete(lfu.freqs, node.freq)
-			if lfu.minFreq == node.freq {
-				lfu.recomputeMinFreq()
-			}
-		}
+func (lfu *LFU) ensureBucket(freq int, before *list.Element) *lfuBucket {
+	if elem, ok := lfu.freqs[freq]; ok {
+		return elem.Value.(*lfuBucket)
 	}
-	delete(lfu.nodes, node.key)
-}
 
-func (lfu *LFU) recomputeMinFreq() {
-	lfu.minFreq = 0
-	for freq := range lfu.freqs {
-		if lfu.minFreq == 0 || freq < lfu.minFreq {
-			lfu.minFreq = freq
-		}
+	bucket := &lfuBucket{
+		freq:    freq,
+		entries: list.New(),
 	}
-}
-
-func (lfu *LFU) bucket(freq int) *list.List {
-	bucket, ok := lfu.freqs[freq]
-	if !ok {
-		bucket = list.New()
-		lfu.freqs[freq] = bucket
+	if before != nil {
+		bucket.element = lfu.order.InsertBefore(bucket, before)
+	} else {
+		bucket.element = lfu.order.PushBack(bucket)
 	}
+	lfu.freqs[freq] = bucket.element
 	return bucket
+}
+
+func (lfu *LFU) removeFromBucket(node *lfuNode) {
+	bucket := node.bucket
+	if bucket == nil {
+		return
+	}
+
+	bucket.entries.Remove(node.element)
+	if bucket.entries.Len() == 0 {
+		lfu.order.Remove(bucket.element)
+		delete(lfu.freqs, bucket.freq)
+	}
+
+	node.bucket = nil
+	node.element = nil
 }
