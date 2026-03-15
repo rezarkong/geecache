@@ -146,39 +146,7 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 	// regardless of the number of concurrent callers.
 	loadCtx := context.WithoutCancel(ctx)
 	resultCh := g.loader.DoChan(key, func() (interface{}, error) {
-		if g.peers != nil {
-			if peer, ok := g.peers.PickPeer(key); ok {
-				peerID := identifyPeer(peer)
-				if !g.allowPeer(peerID) {
-					g.stats.addCircuitRejects(1)
-					g.stats.addPeerFallbacks(1)
-					log.Println("[GeeCache] Skip peer because circuit is open", peerID)
-					return g.getLocally(loadCtx, key)
-				}
-				if value, err = g.getFromPeer(loadCtx, peer, key); err == nil {
-					g.stats.addPeerLoads(1)
-					g.onPeerSuccess(peerID)
-					return value, nil
-				}
-				if errors.Is(err, ErrNotFound) {
-					g.stats.addPeerNotFounds(1)
-					g.onPeerSuccess(peerID)
-					if g.emptyTTL > 0 {
-						g.populateCacheEntry(key, cacheEntry{
-							negative:  true,
-							expiresAt: time.Now().Add(g.emptyTTL),
-						})
-					}
-					return ByteView{}, ErrNotFound
-				}
-				g.stats.addPeerLoadFailures(1)
-				g.stats.addPeerFallbacks(1)
-				g.onPeerFailure(peerID)
-				log.Println("[GeeCache] Failed to get from peer", err)
-			}
-		}
-
-		return g.getLocally(loadCtx, key)
+		return g.loadOnce(loadCtx, key)
 	})
 	select {
 	case <-ctx.Done():
@@ -189,6 +157,50 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 		}
 		return ByteView{}, result.Err
 	}
+}
+
+func (g *Group) loadOnce(ctx context.Context, key string) (ByteView, error) {
+	if value, err, handled := g.loadFromPeer(ctx, key); handled {
+		return value, err
+	}
+	return g.getLocally(ctx, key)
+}
+
+func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, bool) {
+	if g.peers == nil {
+		return ByteView{}, nil, false
+	}
+
+	peer, peerID, ok := g.pickPeer(key)
+	if !ok {
+		return ByteView{}, nil, false
+	}
+	if !g.allowPeer(peerID) {
+		log.Println("[GeeCache] Skip peer because circuit is open", peerID)
+		return ByteView{}, nil, false
+	}
+
+	value, err := g.getFromPeer(ctx, peer, key)
+	if err == nil {
+		g.stats.addPeerLoads(1)
+		g.onPeerSuccess(peerID)
+		return value, nil, true
+	}
+	if errors.Is(err, ErrNotFound) {
+		g.onPeerSuccess(peerID)
+		if g.emptyTTL > 0 {
+			g.populateCacheEntry(key, cacheEntry{
+				negative:  true,
+				expiresAt: time.Now().Add(g.emptyTTL),
+			})
+		}
+		return ByteView{}, ErrNotFound, true
+	}
+
+	g.stats.addPeerFailures(1)
+	g.onPeerFailure(peerID)
+	log.Println("[GeeCache] Failed to get from peer", err)
+	return ByteView{}, nil, false
 }
 
 func (g *Group) populateCache(key string, value ByteView) {
@@ -205,11 +217,8 @@ func (g *Group) populateCacheEntry(key string, entry cacheEntry) {
 
 func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	g.stats.addLocalLoads(1)
-	start := time.Now()
 	bytes, err := g.getter.Get(ctx, key)
-	g.stats.addLocalLoadNanos(time.Since(start).Nanoseconds())
 	if err != nil {
-		g.stats.addLocalLoadErrors(1)
 		if errors.Is(err, ErrNotFound) && g.emptyTTL > 0 {
 			g.populateCacheEntry(key, cacheEntry{
 				negative:  true,
@@ -230,20 +239,13 @@ func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (B
 	}
 	var lastErr error
 	for attempt := 0; attempt <= g.peerRetries; attempt++ {
-		start := time.Now()
 		res := &pb.Response{}
 		err := peer.Get(ctx, req, res)
-		elapsed := time.Since(start).Nanoseconds()
-		g.stats.addPeerAttemptNanos(elapsed)
-		g.stats.addPeerAttempts(1)
 		if err == nil {
-			g.stats.addPeerLoadNanos(elapsed)
 			return ByteView{b: cloneBytes(res.Value)}, nil
 		}
-		g.stats.addPeerFailureNanos(elapsed)
 		lastErr = err
 		if attempt < g.peerRetries && isRetryableError(err) {
-			g.stats.addPeerRetries(1)
 			if g.peerRetryBackoff > 0 {
 				timer := time.NewTimer(time.Duration(attempt+1) * g.peerRetryBackoff)
 				select {
@@ -277,6 +279,14 @@ func identifyPeer(peer PeerGetter) string {
 		return named.ID()
 	}
 	return fmt.Sprintf("%T", peer)
+}
+
+func (g *Group) pickPeer(key string) (PeerGetter, string, bool) {
+	peer, ok := g.peers.PickPeer(key)
+	if !ok {
+		return nil, "", false
+	}
+	return peer, identifyPeer(peer), true
 }
 
 func (g *Group) allowPeer(peerID string) bool {
@@ -314,6 +324,5 @@ func (g *Group) onPeerFailure(peerID string) {
 	if g.peerFailureThreshold > 0 && state.consecutiveFailures >= g.peerFailureThreshold {
 		state.openUntil = time.Now().Add(g.peerCircuitOpen)
 		state.consecutiveFailures = 0
-		g.stats.addCircuitOpenEvents(1)
 	}
 }
