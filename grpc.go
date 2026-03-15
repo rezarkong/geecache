@@ -8,7 +8,6 @@ import (
 	pb "geecache/geecachepb"
 	"log"
 	"sync"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -16,16 +15,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const (
-	defaultReplicas = 50
-	defaultTimeout  = 3 * time.Second
-)
+const defaultReplicas = 50
 
 // GRPCPool implements PeerPicker for a pool of gRPC peers.
 type GRPCPool struct {
 	self string
 
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	peers       *consistenthash.Map
 	grpcGetters map[string]*grpcGetter
 }
@@ -67,8 +63,8 @@ func (p *GRPCPool) Set(peers ...string) {
 
 // Peers returns a copy of the current peer list.
 func (p *GRPCPool) Peers() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	peers := make([]string, 0, len(p.grpcGetters))
 	for peer := range p.grpcGetters {
 		peers = append(peers, peer)
@@ -78,8 +74,8 @@ func (p *GRPCPool) Peers() []string {
 
 // PickPeer picks a peer according to key.
 func (p *GRPCPool) PickPeer(key string) (PeerGetter, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.peers == nil {
 		return nil, false
 	}
@@ -92,14 +88,13 @@ func (p *GRPCPool) PickPeer(key string) (PeerGetter, bool) {
 
 // Register registers the cache service on a grpc.Server.
 func (p *GRPCPool) Register(server *grpc.Server) {
-	pb.RegisterGroupCacheServer(server, &groupCacheServer{self: p.self})
+	pb.RegisterGroupCacheServer(server, &groupCacheServer{})
 }
 
 var _ PeerPicker = (*GRPCPool)(nil)
 
 type groupCacheServer struct {
 	pb.UnimplementedGroupCacheServer
-	self string
 }
 
 func (s *groupCacheServer) Get(ctx context.Context, req *pb.Request) (*pb.Response, error) {
@@ -165,18 +160,9 @@ func (h *grpcGetter) clientFor(ctx context.Context) (pb.GroupCacheClient, error)
 		return h.client, nil
 	}
 
-	dialCtx := ctx
-	var cancel context.CancelFunc
-	if _, ok := ctx.Deadline(); !ok {
-		dialCtx, cancel = context.WithTimeout(ctx, defaultTimeout)
-		defer cancel()
-	}
-
-	conn, err := grpc.DialContext(
-		dialCtx,
+	conn, err := grpc.NewClient(
 		h.addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
 		return nil, err
