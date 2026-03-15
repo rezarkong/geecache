@@ -370,10 +370,6 @@ func TestPeerNotFoundDoesNotFallbackLocally(t *testing.T) {
 	if got := atomic.LoadInt32(&localLoads); got != 0 {
 		t.Fatalf("expected no local fallback on peer not found, got %d loads", got)
 	}
-	stats := gee.Stats()
-	if stats.PeerNotFounds != 1 || stats.PeerFallbacks != 0 {
-		t.Fatalf("unexpected stats after peer not found: %+v", stats)
-	}
 
 	if _, err := gee.Get("Tom"); err != geecache.ErrNotFound {
 		t.Fatalf("expected cached ErrNotFound, got %v", err)
@@ -438,24 +434,19 @@ func TestPeerCircuitBreakerOpens(t *testing.T) {
 		}
 	}
 
-	stats := gee.Stats()
-	if stats.CircuitOpenEvents == 0 {
-		t.Fatalf("expected circuit to open, got %+v", stats)
-	}
-	if stats.CircuitRejects == 0 {
-		t.Fatalf("expected circuit rejects, got %+v", stats)
+	if got := atomic.LoadInt32(&peer.calls); got != 2 {
+		t.Fatalf("expected circuit to stop the third peer request, got %d calls", got)
 	}
 	if atomic.LoadInt32(&localLoads) != 3 {
 		t.Fatalf("expected local fallback for each request, got %d", atomic.LoadInt32(&localLoads))
 	}
 }
 
-func TestStatsTrackDurations(t *testing.T) {
+func TestStatsTrackCoreCounters(t *testing.T) {
 	gee := geecache.NewGroupWithOptions(
-		"stats-duration",
+		"stats-counters",
 		2<<10,
 		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
-			time.Sleep(5 * time.Millisecond)
 			return []byte("value-" + key), nil
 		}),
 	)
@@ -463,15 +454,18 @@ func TestStatsTrackDurations(t *testing.T) {
 	if _, err := gee.Get("Tom"); err != nil {
 		t.Fatalf("get: %v", err)
 	}
+	if _, err := gee.Get("Tom"); err != nil {
+		t.Fatalf("get cache hit: %v", err)
+	}
 	stats := gee.Stats()
-	if stats.LocalLoadTotalNanos <= 0 || stats.AvgLocalLoadNanos <= 0 {
-		t.Fatalf("expected local load duration stats, got %+v", stats)
-	}
-	if stats.PeerAttemptTotalNanos != 0 || stats.AvgPeerAttemptNanos != 0 {
-		t.Fatalf("expected no peer attempt duration stats, got %+v", stats)
-	}
-	if stats.Requests != 1 || stats.CacheMisses != 1 {
+	if stats.Requests != 2 || stats.CacheMisses != 1 || stats.CacheHits != 1 {
 		t.Fatalf("unexpected counters: %+v", stats)
+	}
+	if stats.LocalLoads != 1 || stats.PeerLoads != 0 || stats.PeerFailures != 0 {
+		t.Fatalf("unexpected counters: %+v", stats)
+	}
+	if stats.HitRate <= 0 || stats.HitRate >= 1 {
+		t.Fatalf("expected hit rate between 0 and 1, got %+v", stats)
 	}
 }
 

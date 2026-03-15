@@ -16,6 +16,15 @@ func WithEvictor(factory func() algo.Evictor) Option {
 	}
 }
 
+// WithShards configures how many shards the main cache should use.
+func WithShards(count int) Option {
+	return func(g *Group) {
+		if count > 0 {
+			g.mainCache.shardCount = count
+		}
+	}
+}
+
 // WithCacheTTL sets TTL for normal cache entries and optional positive jitter.
 func WithCacheTTL(ttl, jitter time.Duration) Option {
 	return func(g *Group) {

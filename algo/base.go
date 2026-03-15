@@ -14,9 +14,9 @@ type Evictor interface {
 }
 
 type Cache struct {
+	mu        sync.RWMutex
 	maxBytes  int64
 	nbytes    int64
-	mu        sync.RWMutex
 	cache     map[string]Value
 	evictor   Evictor
 	onEvicted func(key string, value Value)
