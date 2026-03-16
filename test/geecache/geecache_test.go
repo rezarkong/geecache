@@ -569,6 +569,58 @@ func TestReplacingGroupStopsOldCleanup(t *testing.T) {
 	}
 }
 
+func TestDeleteGroupStopsCleanupAndRemovesRegistryEntry(t *testing.T) {
+	group := geecache.NewGroupWithOptions(
+		"delete-group",
+		2<<10,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			return []byte("value-" + key), nil
+		}),
+		geecache.WithCacheTTL(40*time.Millisecond, 0),
+		geecache.WithCleanupInterval(10*time.Millisecond),
+	)
+
+	if _, err := group.Get("Tom"); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+	if ok := geecache.DeleteGroup("delete-group"); !ok {
+		t.Fatal("expected DeleteGroup to remove existing group")
+	}
+	if got := geecache.GetGroup("delete-group"); got != nil {
+		t.Fatalf("expected deleted group lookup to be nil, got %v", got)
+	}
+
+	time.Sleep(90 * time.Millisecond)
+	if got := group.Stats().CacheExpirations; got != 0 {
+		t.Fatalf("expected deleted group cleanup to stop, got expirations=%d", got)
+	}
+}
+
+func TestGroupCloseStopsCleanupAndRemovesRegistryEntry(t *testing.T) {
+	group := geecache.NewGroupWithOptions(
+		"close-group",
+		2<<10,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			return []byte("value-" + key), nil
+		}),
+		geecache.WithCacheTTL(40*time.Millisecond, 0),
+		geecache.WithCleanupInterval(10*time.Millisecond),
+	)
+
+	if _, err := group.Get("Tom"); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+	group.Close()
+	if got := geecache.GetGroup("close-group"); got != nil {
+		t.Fatalf("expected closed group lookup to be nil, got %v", got)
+	}
+
+	time.Sleep(90 * time.Millisecond)
+	if got := group.Stats().CacheExpirations; got != 0 {
+		t.Fatalf("expected closed group cleanup to stop, got expirations=%d", got)
+	}
+}
+
 func TestPeerCircuitBreakerOpens(t *testing.T) {
 	peer := &alwaysFailPeerGetter{err: timeoutNetError{}}
 	var localLoads int32

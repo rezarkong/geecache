@@ -13,6 +13,18 @@
 - 可选后台清理过期项：`WithCleanupInterval`
 - 运行时核心指标导出
 
+## 文档
+
+更详细的实现说明已经整理到 `./doc`：
+
+- `doc/README.md`：文档索引
+- `doc/01-overview.md`：项目总览与技术栈
+- `doc/02-request-flow.md`：一次 `Get` 的完整流程
+- `doc/03-cache-layer.md`：本地缓存与 TTL / shard 设计
+- `doc/04-distributed-layer.md`：一致性哈希、gRPC、容错链路
+- `doc/05-eviction-algorithms.md`：LRU / LFU / LRU-K / ARC
+- `doc/06-testing-and-benchmark.md`：测试、benchmark、压测与亮点提炼
+
 ## 项目结构
 
 核心文件：

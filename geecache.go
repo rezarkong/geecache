@@ -17,6 +17,7 @@ type Group struct {
 	name      string
 	getter    Getter
 	mainCache cache
+	peersMu   sync.RWMutex
 	peers     PeerPicker
 	// use singleflight.Group to make sure that
 	// each key is only fetched once
@@ -40,6 +41,7 @@ type Group struct {
 	stats                *Stats
 	cleanupStop          chan struct{}
 	cleanupDone          chan struct{}
+	cleanupMu            sync.Mutex
 }
 
 type peerCircuitState struct {
@@ -76,8 +78,9 @@ func NewGroupWithOptions(name string, cacheBytes int64, getter Getter, opts ...O
 		panic("nil Getter")
 	}
 	mu.Lock()
-	defer mu.Unlock()
-	if existing := groups[name]; existing != nil {
+	existing := groups[name]
+	mu.Unlock()
+	if existing != nil {
 		existing.stopCleanup()
 	}
 	g := &Group{
@@ -96,7 +99,9 @@ func NewGroupWithOptions(name string, cacheBytes int64, getter Getter, opts ...O
 		opt(g)
 	}
 	g.startCleanup()
+	mu.Lock()
 	groups[name] = g
+	mu.Unlock()
 	return g
 }
 
@@ -107,6 +112,21 @@ func GetGroup(name string) *Group {
 	g := groups[name]
 	mu.RUnlock()
 	return g
+}
+
+// DeleteGroup removes and stops the named group if it exists.
+func DeleteGroup(name string) bool {
+	mu.Lock()
+	g := groups[name]
+	if g != nil {
+		delete(groups, name)
+	}
+	mu.Unlock()
+	if g == nil {
+		return false
+	}
+	g.stopCleanup()
+	return true
 }
 
 // Get value for a key from cache
@@ -137,6 +157,8 @@ func (g *Group) GetContext(ctx context.Context, key string) (ByteView, error) {
 
 // RegisterPeers registers a PeerPicker for choosing remote peer
 func (g *Group) RegisterPeers(peers PeerPicker) {
+	g.peersMu.Lock()
+	defer g.peersMu.Unlock()
 	if g.peers != nil {
 		panic("RegisterPeerPicker called more than once")
 	}
@@ -146,6 +168,16 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 // Stats returns a snapshot of group metrics.
 func (g *Group) Stats() StatsSnapshot {
 	return g.stats.Snapshot()
+}
+
+// Close removes the group from the global registry and stops background cleanup.
+func (g *Group) Close() {
+	mu.Lock()
+	if current := groups[g.name]; current == g {
+		delete(groups, g.name)
+	}
+	mu.Unlock()
+	g.stopCleanup()
 }
 
 // Delete removes keys from the local cache.
@@ -184,10 +216,6 @@ func (g *Group) loadOnce(ctx context.Context, key string) (ByteView, error) {
 }
 
 func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, bool) {
-	if g.peers == nil {
-		return ByteView{}, nil, false
-	}
-
 	peer, peerID, ok := g.pickPeer(key)
 	if !ok {
 		return ByteView{}, nil, false
@@ -299,7 +327,13 @@ func identifyPeer(peer PeerGetter) string {
 }
 
 func (g *Group) pickPeer(key string) (PeerGetter, string, bool) {
-	peer, ok := g.peers.PickPeer(key)
+	g.peersMu.RLock()
+	peers := g.peers
+	g.peersMu.RUnlock()
+	if peers == nil {
+		return nil, "", false
+	}
+	peer, ok := peers.PickPeer(key)
 	if !ok {
 		return nil, "", false
 	}
@@ -345,7 +379,12 @@ func (g *Group) onPeerFailure(peerID string) {
 }
 
 func (g *Group) startCleanup() {
+	g.cleanupMu.Lock()
+	defer g.cleanupMu.Unlock()
 	if g.cleanupInterval <= 0 {
+		return
+	}
+	if g.cleanupStop != nil {
 		return
 	}
 
@@ -370,6 +409,8 @@ func (g *Group) startCleanup() {
 }
 
 func (g *Group) stopCleanup() {
+	g.cleanupMu.Lock()
+	defer g.cleanupMu.Unlock()
 	if g.cleanupStop == nil {
 		return
 	}
