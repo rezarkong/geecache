@@ -45,19 +45,44 @@ func (c *cache) add(key string, entry cacheEntry) {
 
 func (c *cache) get(key string) (entry cacheEntry, ok bool) {
 	shard := c.shardFor(key)
-	if v, ok := shard.store.Get(key); ok {
-		entry = v.(cacheEntry)
-		if entry.expired(time.Now()) {
-			shard.store.Remove(key)
-			if c.onExpire != nil {
-				c.onExpire()
-			}
-			return cacheEntry{}, false
+	now := time.Now()
+	if v, ok, removed := shard.store.GetOrRemoveIf(key, func(v algo.Value) bool {
+		return v.(cacheEntry).expired(now)
+	}); ok {
+		return v.(cacheEntry), true
+	} else if removed {
+		if c.onExpire != nil {
+			c.onExpire()
 		}
-		return entry, ok
 	}
 
 	return
+}
+
+func (c *cache) delete(keys ...string) {
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		shard := c.shardFor(key)
+		shard.store.Remove(key)
+	}
+}
+
+func (c *cache) clear() {
+	for i := range c.ensureShards() {
+		for _, key := range c.shards[i].store.Keys() {
+			c.shards[i].store.Remove(key)
+		}
+	}
+}
+
+func (c *cache) cleanupExpired(now time.Time) int {
+	expired := 0
+	for i := range c.ensureShards() {
+		expired += c.cleanupExpiredShard(&c.shards[i], now)
+	}
+	return expired
 }
 
 func (c *cache) evictor() algo.Evictor {
@@ -126,4 +151,16 @@ func (c *cache) shardIndexWithCount(key string, count int) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
 	return int(h.Sum32() % uint32(count))
+}
+
+func (c *cache) cleanupExpiredShard(shard *cacheShard, now time.Time) int {
+	expired := 0
+	for _, key := range shard.store.Keys() {
+		if shard.store.RemoveIf(key, func(v algo.Value) bool {
+			return v.(cacheEntry).expired(now)
+		}) {
+			expired++
+		}
+	}
+	return expired
 }

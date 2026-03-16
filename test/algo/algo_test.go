@@ -75,6 +75,34 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+func TestGetOrRemoveIfRemovesMatchingValue(t *testing.T) {
+	cache := algo.New(int64(0), nil, nil)
+	cache.Add("key", String("value"))
+
+	if _, ok, removed := cache.GetOrRemoveIf("key", func(v algo.Value) bool {
+		return string(v.(String)) == "value"
+	}); ok || !removed {
+		t.Fatal("expected matching key to be removed atomically")
+	}
+	if _, ok := cache.Get("key"); ok {
+		t.Fatal("expected removed key to stay missing")
+	}
+}
+
+func TestRemoveIfDoesNotRemoveUpdatedValue(t *testing.T) {
+	cache := algo.New(int64(0), nil, nil)
+	cache.Add("key", String("new"))
+
+	if removed := cache.RemoveIf("key", func(v algo.Value) bool {
+		return string(v.(String)) == "old"
+	}); removed {
+		t.Fatal("expected RemoveIf to keep non-matching value")
+	}
+	if v, ok := cache.Get("key"); !ok || string(v.(String)) != "new" {
+		t.Fatal("expected current value to remain accessible")
+	}
+}
+
 func TestLFUEvictsLeastFrequentlyUsed(t *testing.T) {
 	cache := algo.New(int64(len("a1")+len("b22")), algo.NewLFU(), nil)
 	cache.Add("a", String("1"))

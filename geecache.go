@@ -29,14 +29,17 @@ type Group struct {
 	// emptyTTL caches ErrNotFound values for a short period.
 	emptyTTL time.Duration
 	// cacheTTL sets TTL for normal cache entries; cacheTTLJitter spreads expirations.
-	cacheTTL       time.Duration
-	cacheTTLJitter time.Duration
+	cacheTTL        time.Duration
+	cacheTTLJitter  time.Duration
+	cleanupInterval time.Duration
 	// circuit breaker state for peer fetches.
 	peerFailureThreshold int
 	peerCircuitOpen      time.Duration
 	circuitMu            sync.Mutex
 	peerCircuits         map[string]*peerCircuitState
 	stats                *Stats
+	cleanupStop          chan struct{}
+	cleanupDone          chan struct{}
 }
 
 type peerCircuitState struct {
@@ -74,6 +77,9 @@ func NewGroupWithOptions(name string, cacheBytes int64, getter Getter, opts ...O
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	if existing := groups[name]; existing != nil {
+		existing.stopCleanup()
+	}
 	g := &Group{
 		name:                 name,
 		getter:               getter,
@@ -89,6 +95,7 @@ func NewGroupWithOptions(name string, cacheBytes int64, getter Getter, opts ...O
 	for _, opt := range opts {
 		opt(g)
 	}
+	g.startCleanup()
 	groups[name] = g
 	return g
 }
@@ -139,6 +146,16 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 // Stats returns a snapshot of group metrics.
 func (g *Group) Stats() StatsSnapshot {
 	return g.stats.Snapshot()
+}
+
+// Delete removes keys from the local cache.
+func (g *Group) Delete(keys ...string) {
+	g.mainCache.delete(keys...)
+}
+
+// Clear removes all local cache entries.
+func (g *Group) Clear() {
+	g.mainCache.clear()
 }
 
 func (g *Group) load(ctx context.Context, key string) (value ByteView, err error) {
@@ -325,4 +342,39 @@ func (g *Group) onPeerFailure(peerID string) {
 		state.openUntil = time.Now().Add(g.peerCircuitOpen)
 		state.consecutiveFailures = 0
 	}
+}
+
+func (g *Group) startCleanup() {
+	if g.cleanupInterval <= 0 {
+		return
+	}
+
+	g.cleanupStop = make(chan struct{})
+	g.cleanupDone = make(chan struct{})
+	go func() {
+		defer close(g.cleanupDone)
+		ticker := time.NewTicker(g.cleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				expired := g.mainCache.cleanupExpired(time.Now())
+				if expired > 0 {
+					g.stats.addCacheExpirations(int64(expired))
+				}
+			case <-g.cleanupStop:
+				return
+			}
+		}
+	}()
+}
+
+func (g *Group) stopCleanup() {
+	if g.cleanupStop == nil {
+		return
+	}
+	close(g.cleanupStop)
+	<-g.cleanupDone
+	g.cleanupStop = nil
+	g.cleanupDone = nil
 }

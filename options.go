@@ -37,6 +37,15 @@ func WithCacheTTL(ttl, jitter time.Duration) Option {
 	}
 }
 
+// WithCleanupInterval enables background cleanup of expired cache entries.
+func WithCleanupInterval(interval time.Duration) Option {
+	return func(g *Group) {
+		if interval > 0 {
+			g.cleanupInterval = interval
+		}
+	}
+}
+
 // WithPeerRetries retries peer fetches before falling back locally.
 func WithPeerRetries(retries int) Option {
 	return func(g *Group) {

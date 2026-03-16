@@ -57,13 +57,29 @@ func (c *Cache) Add(key string, value Value) {
 }
 
 func (c *Cache) Get(key string) (value Value, ok bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if value, ok = c.cache[key]; ok {
 		c.evictor.OnAccess(key)
 		return value, true
 	}
 	return nil, false
+}
+
+func (c *Cache) GetOrRemoveIf(key string, predicate func(Value) bool) (value Value, ok bool, removed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	value, ok = c.cache[key]
+	if !ok {
+		return nil, false, false
+	}
+	if predicate != nil && predicate(value) {
+		c.removeKey(key)
+		return nil, false, true
+	}
+	c.evictor.OnAccess(key)
+	return value, true, false
 }
 
 func (c *Cache) Remove(key string) {
@@ -72,10 +88,35 @@ func (c *Cache) Remove(key string) {
 	c.removeKey(key)
 }
 
+func (c *Cache) RemoveIf(key string, predicate func(Value) bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	value, ok := c.cache[key]
+	if !ok {
+		return false
+	}
+	if predicate != nil && !predicate(value) {
+		return false
+	}
+	c.removeKey(key)
+	return true
+}
+
 func (c *Cache) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.cache)
+}
+
+func (c *Cache) Keys() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.cache))
+	for key := range c.cache {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func (c *Cache) removeOldest() {

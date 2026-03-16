@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"reflect"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -413,6 +414,161 @@ func TestGetUsesPositiveCacheTTL(t *testing.T) {
 	}
 }
 
+func TestDeleteForcesReload(t *testing.T) {
+	var loads int32
+	gee := geecache.NewGroup(
+		"delete-key",
+		2<<10,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			atomic.AddInt32(&loads, 1)
+			return []byte("value-" + key), nil
+		}),
+	)
+
+	if _, err := gee.Get("Tom"); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+	if _, err := gee.Get("Jack"); err != nil {
+		t.Fatalf("warm second key: %v", err)
+	}
+	gee.Delete("Tom", "Jack")
+	if _, err := gee.Get("Tom"); err != nil {
+		t.Fatalf("reload after delete: %v", err)
+	}
+	if _, err := gee.Get("Jack"); err != nil {
+		t.Fatalf("reload second key after delete: %v", err)
+	}
+	if got := atomic.LoadInt32(&loads); got != 4 {
+		t.Fatalf("expected delete to force reload for both keys, got %d loads", got)
+	}
+}
+
+func TestGroupWorksWithConfiguredShards(t *testing.T) {
+	var loads int32
+	gee := geecache.NewGroupWithOptions(
+		"sharded-group",
+		256,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			atomic.AddInt32(&loads, 1)
+			return []byte("value-" + key), nil
+		}),
+		geecache.WithShards(4),
+	)
+
+	keys := []string{"alpha", "beta", "gamma", "delta"}
+	for _, key := range keys {
+		view, err := gee.Get(key)
+		if err != nil {
+			t.Fatalf("get %q: %v", key, err)
+		}
+		if got := view.String(); got != "value-"+key {
+			t.Fatalf("unexpected value for %q: %q", key, got)
+		}
+	}
+
+	for _, key := range keys {
+		if _, err := gee.Get(key); err != nil {
+			t.Fatalf("get cached %q: %v", key, err)
+		}
+	}
+
+	if got := atomic.LoadInt32(&loads); got != int32(len(keys)) {
+		t.Fatalf("expected one load per key with shards enabled, got %d", got)
+	}
+}
+
+func TestClearForcesReload(t *testing.T) {
+	var loads int32
+	gee := geecache.NewGroup(
+		"clear-cache",
+		2<<10,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			atomic.AddInt32(&loads, 1)
+			return []byte("value-" + key), nil
+		}),
+	)
+
+	if _, err := gee.Get("Tom"); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+	if _, err := gee.Get("Jack"); err != nil {
+		t.Fatalf("warm second key: %v", err)
+	}
+	gee.Clear()
+	if _, err := gee.Get("Tom"); err != nil {
+		t.Fatalf("reload after clear: %v", err)
+	}
+	if _, err := gee.Get("Jack"); err != nil {
+		t.Fatalf("reload second key after clear: %v", err)
+	}
+	if got := atomic.LoadInt32(&loads); got != 4 {
+		t.Fatalf("expected clear to force reload for all keys, got %d loads", got)
+	}
+}
+
+func TestBackgroundCleanupRemovesExpiredEntries(t *testing.T) {
+	var loads int32
+	gee := geecache.NewGroupWithOptions(
+		"cleanup-expired",
+		2<<10,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			atomic.AddInt32(&loads, 1)
+			return []byte("value-" + key), nil
+		}),
+		geecache.WithCacheTTL(15*time.Millisecond, 0),
+		geecache.WithCleanupInterval(5*time.Millisecond),
+	)
+
+	if _, err := gee.Get("Tom"); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+
+	time.Sleep(40 * time.Millisecond)
+
+	if _, err := gee.Get("Tom"); err != nil {
+		t.Fatalf("reload after cleanup: %v", err)
+	}
+	if got := atomic.LoadInt32(&loads); got != 2 {
+		t.Fatalf("expected cleanup to remove expired entry and trigger reload, got %d loads", got)
+	}
+	if stats := gee.Stats(); stats.CacheExpirations == 0 {
+		t.Fatalf("expected cleanup to record expirations, got %+v", stats)
+	}
+}
+
+func TestReplacingGroupStopsOldCleanup(t *testing.T) {
+	oldGroup := geecache.NewGroupWithOptions(
+		"cleanup-replaced",
+		2<<10,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			return []byte("old-" + key), nil
+		}),
+		geecache.WithCacheTTL(40*time.Millisecond, 0),
+		geecache.WithCleanupInterval(10*time.Millisecond),
+	)
+
+	if _, err := oldGroup.Get("Tom"); err != nil {
+		t.Fatalf("warm old group: %v", err)
+	}
+
+	newGroup := geecache.NewGroupWithOptions(
+		"cleanup-replaced",
+		2<<10,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			return []byte("new-" + key), nil
+		}),
+	)
+
+	time.Sleep(90 * time.Millisecond)
+
+	if got := oldGroup.Stats().CacheExpirations; got != 0 {
+		t.Fatalf("expected old cleanup goroutine to stop after replacement, got expirations=%d", got)
+	}
+	if view, err := newGroup.Get("Tom"); err != nil || view.String() != "new-Tom" {
+		t.Fatalf("expected replacement group to be active, got value=%q err=%v", view.String(), err)
+	}
+}
+
 func TestPeerCircuitBreakerOpens(t *testing.T) {
 	peer := &alwaysFailPeerGetter{err: timeoutNetError{}}
 	var localLoads int32
@@ -555,16 +711,13 @@ func BenchmarkGroupGetMixedWorkload(b *testing.B) {
 	restore := silenceLogs()
 	defer restore()
 
-	const (
-		hotKeys      = 3
-		coldKeys     = 128
-		blockSize    = 10
-		coldPerBlock = 8
-		cacheEntries = 5
-		valueLen     = 1
-	)
-
-	cacheBytes := int64(cacheEntries * (len("c000") + valueLen))
+	hotKeys := benchmarkEnvInt("BENCH_HOT_KEYS", 3)
+	coldKeys := benchmarkEnvInt("BENCH_COLD_KEYS", 128)
+	blockSize := benchmarkEnvInt("BENCH_BLOCK_SIZE", 10)
+	coldPerBlock := benchmarkEnvInt("BENCH_COLD_PER_BLOCK", 8)
+	cacheEntries := benchmarkEnvInt("BENCH_CACHE_ENTRIES", 5)
+	warmHits := benchmarkEnvInt("BENCH_WARM_HITS", 200)
+	cacheBytes := int64(cacheEntries * (len("c000000") + 1))
 	var loads int64
 	gee := geecache.NewGroupWithOptions(
 		"benchmark-mixed",
@@ -577,8 +730,8 @@ func BenchmarkGroupGetMixedWorkload(b *testing.B) {
 	)
 
 	// Warm up hot keys so LFU can accumulate frequency before cold scans start.
-	for i := 0; i < 200; i++ {
-		key := fmt.Sprintf("h%02d", i%hotKeys)
+	for i := 0; i < warmHits; i++ {
+		key := fmt.Sprintf("h%06d", i%hotKeys)
 		if _, err := gee.Get(key); err != nil {
 			b.Fatalf("warm hot key: %v", err)
 		}
@@ -589,10 +742,45 @@ func BenchmarkGroupGetMixedWorkload(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var key string
 		if i%blockSize < coldPerBlock {
-			key = fmt.Sprintf("c%03d", i%coldKeys)
+			key = fmt.Sprintf("c%06d", i%coldKeys)
 		} else {
-			key = fmt.Sprintf("h%02d", i%hotKeys)
+			key = fmt.Sprintf("h%06d", i%hotKeys)
 		}
+		if _, err := gee.Get(key); err != nil {
+			b.Fatalf("get: %v", err)
+		}
+	}
+	b.StopTimer()
+
+	misses := atomic.LoadInt64(&loads) - startLoads
+	hitRatio := float64(int64(b.N)-misses) / float64(b.N)
+	missRatio := float64(misses) / float64(b.N)
+	b.ReportMetric(hitRatio, "hit_ratio")
+	b.ReportMetric(missRatio, "miss_ratio")
+}
+
+func BenchmarkGroupGetWideKeyspace(b *testing.B) {
+	restore := silenceLogs()
+	defer restore()
+
+	uniqueKeys := benchmarkEnvInt("BENCH_UNIQUE_KEYS", 65536)
+	cacheEntries := benchmarkEnvInt("BENCH_CACHE_ENTRIES", 5)
+	cacheBytes := int64(cacheEntries * (len("u000000") + 1))
+	var loads int64
+	gee := geecache.NewGroupWithOptions(
+		"benchmark-wide-keyspace",
+		cacheBytes,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			atomic.AddInt64(&loads, 1)
+			return []byte("v"), nil
+		}),
+		benchmarkEvictorOption(b),
+	)
+
+	startLoads := atomic.LoadInt64(&loads)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("u%06d", i%uniqueKeys)
 		if _, err := gee.Get(key); err != nil {
 			b.Fatalf("get: %v", err)
 		}
@@ -622,4 +810,16 @@ func benchmarkEvictorOption(b *testing.B) geecache.Option {
 		b.Fatalf("unsupported BENCH_EVICTOR %q", evictor)
 		return nil
 	}
+}
+
+func benchmarkEnvInt(name string, fallback int) int {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
 }
