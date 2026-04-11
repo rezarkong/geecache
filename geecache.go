@@ -22,6 +22,8 @@ type Group struct {
 	// use singleflight.Group to make sure that
 	// each key is only fetched once
 	loader *singleflight.Group
+	// localLoader suppresses duplicate local-only loads used by peer handlers.
+	localLoader *singleflight.Group
 	// peerRetries controls how many times a peer fetch is retried
 	// before falling back to the local getter.
 	peerRetries int
@@ -77,17 +79,12 @@ func NewGroupWithOptions(name string, cacheBytes int64, getter Getter, opts ...O
 	if getter == nil {
 		panic("nil Getter")
 	}
-	mu.Lock()
-	existing := groups[name]
-	mu.Unlock()
-	if existing != nil {
-		existing.stopCleanup()
-	}
 	g := &Group{
 		name:                 name,
 		getter:               getter,
 		mainCache:            cache{cacheBytes: cacheBytes},
 		loader:               &singleflight.Group{},
+		localLoader:          &singleflight.Group{},
 		peerRetryBackoff:     50 * time.Millisecond,
 		peerFailureThreshold: 3,
 		peerCircuitOpen:      2 * time.Second,
@@ -98,9 +95,13 @@ func NewGroupWithOptions(name string, cacheBytes int64, getter Getter, opts ...O
 	for _, opt := range opts {
 		opt(g)
 	}
-	g.startCleanup()
 	mu.Lock()
+	existing := groups[name]
+	if existing != nil {
+		existing.stopCleanup()
+	}
 	groups[name] = g
+	g.startCleanup()
 	mu.Unlock()
 	return g
 }
@@ -136,6 +137,14 @@ func (g *Group) Get(key string) (ByteView, error) {
 
 // GetContext returns the value for a key using the provided context.
 func (g *Group) GetContext(ctx context.Context, key string) (ByteView, error) {
+	return g.get(ctx, key, g.loader, g.loadOnce)
+}
+
+func (g *Group) getLocallyContext(ctx context.Context, key string) (ByteView, error) {
+	return g.get(ctx, key, g.localLoader, g.getLocally)
+}
+
+func (g *Group) get(ctx context.Context, key string, loader *singleflight.Group, loadFn func(context.Context, string) (ByteView, error)) (ByteView, error) {
 	if key == "" {
 		return ByteView{}, fmt.Errorf("key is required")
 	}
@@ -152,7 +161,7 @@ func (g *Group) GetContext(ctx context.Context, key string) (ByteView, error) {
 	}
 	g.stats.addCacheMisses(1)
 
-	return g.load(ctx, key)
+	return g.load(ctx, key, loader, loadFn)
 }
 
 // RegisterPeers registers a PeerPicker for choosing remote peer
@@ -190,12 +199,12 @@ func (g *Group) Clear() {
 	g.mainCache.clear()
 }
 
-func (g *Group) load(ctx context.Context, key string) (value ByteView, err error) {
+func (g *Group) load(ctx context.Context, key string, loader *singleflight.Group, loadFn func(context.Context, string) (ByteView, error)) (value ByteView, err error) {
 	// each key is only fetched once (either locally or remotely)
 	// regardless of the number of concurrent callers.
 	loadCtx := context.WithoutCancel(ctx)
-	resultCh := g.loader.DoChan(key, func() (interface{}, error) {
-		return g.loadOnce(loadCtx, key)
+	resultCh := loader.DoChan(key, func() (interface{}, error) {
+		return loadFn(loadCtx, key)
 	})
 	select {
 	case <-ctx.Done():
@@ -240,6 +249,12 @@ func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, 
 			})
 		}
 		return ByteView{}, ErrNotFound, true
+	}
+	if errors.Is(err, ErrGroupNotFound) {
+		g.stats.addPeerFailures(1)
+		g.onPeerFailure(peerID)
+		log.Println("[GeeCache] Peer is missing group", err)
+		return ByteView{}, err, true
 	}
 
 	g.stats.addPeerFailures(1)

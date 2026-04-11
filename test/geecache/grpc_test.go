@@ -3,12 +3,14 @@ package geecache_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"geecache"
 	pb "geecache/geecachepb"
 	"net"
 	"reflect"
 	"sort"
+	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -18,6 +20,12 @@ func startTestGRPCServer(t *testing.T, groupName string, getter geecache.Getter)
 	t.Helper()
 
 	geecache.NewGroup(groupName, 2<<10, getter)
+	return startRegisteredGRPCServer(t)
+}
+
+func startRegisteredGRPCServer(t *testing.T) (string, func()) {
+	t.Helper()
+
 	pool := geecache.NewGRPCPool("self")
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -32,6 +40,29 @@ func startTestGRPCServer(t *testing.T, groupName string, getter geecache.Getter)
 		server.Stop()
 		_ = lis.Close()
 	}
+}
+
+func startBareTestGRPCServer(t *testing.T) (string, func()) {
+	t.Helper()
+	return startRegisteredGRPCServer(t)
+}
+
+type countingPeerPicker struct {
+	calls  int32
+	getter geecache.PeerGetter
+}
+
+func (p *countingPeerPicker) PickPeer(string) (geecache.PeerGetter, bool) {
+	atomic.AddInt32(&p.calls, 1)
+	return p.getter, true
+}
+
+type staticPeerGetter struct {
+	err error
+}
+
+func (g staticPeerGetter) Get(context.Context, *pb.Request, *pb.Response) error {
+	return g.err
 }
 
 func TestGRPCGetterFetchesFromPeer(t *testing.T) {
@@ -116,6 +147,77 @@ func TestGRPCGetterReturnsNotFound(t *testing.T) {
 	err := getter.Get(context.Background(), &pb.Request{Group: groupName, Key: "Tom"}, &pb.Response{})
 	if err != geecache.ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestGRPCServerGetDoesNotForwardToOtherPeers(t *testing.T) {
+	groupName := "grpc-local-only"
+	group := geecache.NewGroup(groupName, 2<<10, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		return []byte("local-" + key), nil
+	}))
+	defer group.Close()
+
+	picker := &countingPeerPicker{getter: staticPeerGetter{err: fmt.Errorf("unexpected peer forward")}}
+	group.RegisterPeers(picker)
+
+	addr, cleanup := startRegisteredGRPCServer(t)
+	defer cleanup()
+
+	pool := geecache.NewGRPCPool("self")
+	pool.Set(addr)
+	getter, ok := pool.PickPeer("Tom")
+	if !ok {
+		t.Fatal("expected peer getter")
+	}
+
+	var out pb.Response
+	if err := getter.Get(context.Background(), &pb.Request{Group: groupName, Key: "Tom"}, &out); err != nil {
+		t.Fatalf("getter.Get: %v", err)
+	}
+	if got := string(out.Value); got != "local-Tom" {
+		t.Fatalf("unexpected value %q", got)
+	}
+	if got := atomic.LoadInt32(&picker.calls); got != 0 {
+		t.Fatalf("expected grpc handler to stay local, got %d peer picks", got)
+	}
+}
+
+func TestGRPCGetterReturnsGroupNotFound(t *testing.T) {
+	addr, cleanup := startBareTestGRPCServer(t)
+	defer cleanup()
+
+	pool := geecache.NewGRPCPool("self")
+	pool.Set(addr)
+	getter, ok := pool.PickPeer("Tom")
+	if !ok {
+		t.Fatal("expected peer getter")
+	}
+
+	err := getter.Get(context.Background(), &pb.Request{Group: "missing-group", Key: "Tom"}, &pb.Response{})
+	if !errors.Is(err, geecache.ErrGroupNotFound) {
+		t.Fatalf("expected ErrGroupNotFound, got %v", err)
+	}
+	if errors.Is(err, geecache.ErrNotFound) {
+		t.Fatalf("group lookup error must not be collapsed into ErrNotFound: %v", err)
+	}
+}
+
+func TestGroupGetSurfacesPeerGroupNotFound(t *testing.T) {
+	var localLoads int32
+	group := geecache.NewGroup("peer-group-missing", 2<<10, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&localLoads, 1)
+		return []byte("local-" + key), nil
+	}))
+	defer group.Close()
+
+	group.RegisterPeers(&countingPeerPicker{getter: staticPeerGetter{err: geecache.ErrGroupNotFound}})
+
+	_, err := group.Get("Tom")
+	if !errors.Is(err, geecache.ErrGroupNotFound) {
+		t.Fatalf("expected ErrGroupNotFound, got %v", err)
+	}
+	if got := atomic.LoadInt32(&localLoads); got != 0 {
+		t.Fatalf("expected no local fallback on peer group mismatch, got %d loads", got)
 	}
 }
 

@@ -100,10 +100,10 @@ type groupCacheServer struct {
 func (s *groupCacheServer) Get(ctx context.Context, req *pb.Request) (*pb.Response, error) {
 	group := GetGroup(req.GetGroup())
 	if group == nil {
-		return nil, status.Errorf(codes.NotFound, "no such group: %s", req.GetGroup())
+		return nil, status.Errorf(codes.FailedPrecondition, "group %q is not registered", req.GetGroup())
 	}
 
-	view, err := group.GetContext(ctx, req.GetKey())
+	view, err := group.getLocallyContext(ctx, req.GetKey())
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, status.Error(codes.NotFound, err.Error())
@@ -132,8 +132,11 @@ func (h *grpcGetter) Get(ctx context.Context, in *pb.Request, out *pb.Response) 
 	}
 	resp, err := client.Get(ctx, in)
 	if err != nil {
-		if status.Code(err) == codes.NotFound {
+		switch status.Code(err) {
+		case codes.NotFound:
 			return ErrNotFound
+		case codes.FailedPrecondition:
+			return fmt.Errorf("%w: %s", ErrGroupNotFound, status.Convert(err).Message())
 		}
 		return err
 	}

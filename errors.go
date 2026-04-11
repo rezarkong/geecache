@@ -7,10 +7,12 @@ import (
 
 var ErrNotFound = errors.New("geecache: key not found")
 
+var ErrGroupNotFound = errors.New("geecache: group not found")
+
 var ErrCircuitOpen = errors.New("geecache: peer circuit open")
 
 func isRetryableError(err error) bool {
-	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrCircuitOpen) {
+	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrGroupNotFound) || errors.Is(err, ErrCircuitOpen) {
 		return false
 	}
 
