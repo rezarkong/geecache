@@ -20,7 +20,7 @@
 - `docs/doc/README.md`：文档索引
 - `docs/doc/01-overview.md`：项目总览与技术栈
 - `docs/doc/02-request-flow.md`：一次 `Get` 的完整流程
-- `docs/doc/03-cache-layer.md`：本地缓存与 TTL / shard 设计
+- `docs/doc/03-Cache-layer.md`：本地缓存与 TTL / shard 设计
 - `docs/doc/04-distributed-layer.md`：一致性哈希、gRPC、容错链路
 - `docs/doc/05-eviction-algorithms.md`：LRU / LFU / LRU-K / ARC
 - `docs/doc/06-testing-and-benchmark.md`：测试、benchmark、压测与亮点提炼
@@ -30,7 +30,7 @@
 核心文件：
 
 - `geecache.go`：`Group` 生命周期、缓存读取主链路、peer fallback、TTL 回填、显式失效
-- `cache.go`：本地 shard cache 封装、TTL 检查、后台清理入口
+- `Cache.go`：本地 shard Cache 封装、TTL 检查、后台清理入口
 - `grpc.go`：peer 选择、gRPC 服务端和客户端
 - `options.go`：缓存 TTL、空值缓存、shard、peer 重试、后台清理等配置项
 - `stats.go`：核心指标快照
@@ -94,7 +94,7 @@ group := geecache.NewGroupWithOptions(
 - Go 1.24+
 - 本机可监听 `localhost:8001`、`localhost:8002`、`localhost:8003`、`localhost:9999`
 
-启动 3 个纯 gRPC cache 节点：
+启动 3 个纯 gRPC Cache 节点：
 
 ```bash
 make demo-node1

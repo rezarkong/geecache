@@ -7,23 +7,29 @@ import (
 	"time"
 )
 
+// cache.go 缓存包装层 负责 cache 的业务缓存包装
+// algo 是可替换的底层淘汰器和通用内存缓存容器
+
 const defaultShardCount = 1
 
+// 缓存包装
 type cache struct {
-	cacheBytes int64
-	shardCount int
-	onExpire   func()
-	newEvictor func() algo.Evictor
+	cacheBytes int64               // cache
+	shardCount int                 // 分片的实现
+	onExpire   func()              // 过期操作器
+	newEvictor func() algo.Evictor // 淘汰选取器
 
 	mu     sync.RWMutex
 	shards []cacheShard
 }
 
+// Cache 切片
 type cacheShard struct {
 	store      *algo.Cache
 	cacheBytes int64
 }
 
+// cache 封装
 type cacheEntry struct {
 	value     ByteView
 	expiresAt time.Time
@@ -35,6 +41,7 @@ func (e cacheEntry) Len() int {
 }
 
 func (e cacheEntry) expired(now time.Time) bool {
+	// TTL 非零且当前过了过期时间
 	return !e.expiresAt.IsZero() && now.After(e.expiresAt)
 }
 

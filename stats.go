@@ -26,6 +26,7 @@ type Stats struct {
 	cacheExpirations int64
 }
 
+// 计算命中率
 func (s *Stats) Snapshot() StatsSnapshot {
 	requests := atomic.LoadInt64(&s.requests)
 	cacheHits := atomic.LoadInt64(&s.cacheHits)

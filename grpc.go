@@ -26,7 +26,7 @@ type GRPCPool struct {
 	grpcGetters map[string]*grpcGetter
 }
 
-// NewGRPCPool initializes a gRPC pool of peers.
+// NewGRPCPool 初始化 Peers 的 Pool
 func NewGRPCPool(self string) *GRPCPool {
 	return &GRPCPool{self: self}
 }
@@ -116,8 +116,8 @@ func (s *groupCacheServer) Get(ctx context.Context, req *pb.Request) (*pb.Respon
 type grpcGetter struct {
 	addr string
 
-	mu     sync.Mutex
-	conn   *grpc.ClientConn
+	mu     sync.Mutex       // 懒连接，所以后面 conn 和 client 要保护
+	conn   *grpc.ClientConn // 连接生命周期管理的核心对象
 	client pb.GroupCacheClient
 }
 

@@ -11,7 +11,7 @@ type lrukNode struct {
 
 // LRUK is a two-queue approximation of LRU-K.
 // Keys stay in history until they have been observed k times,
-// then they are promoted into the main cache queue and managed by LRU.
+// then they are promoted into the main Cache queue and managed by LRU.
 type LRUK struct {
 	k       int
 	nodes   map[string]*lrukNode
