@@ -124,6 +124,11 @@ func (g *Group) Delete(keys ...string) {
 	g.mainCache.delete(keys...)
 }
 
+// Clear 清空当前 group 的本地缓存
+func (g *Group) Clear() {
+	g.mainCache.clear()
+}
+
 // Close 关闭 group
 func (g *Group) Close() {
 	if g.closed.Load() == true {
@@ -179,6 +184,9 @@ func (g *Group) load(ctx context.Context, key string, loader *singleflight.Group
 		return ByteView{}, ctx.Err()
 	case result := <-resultCh:
 		if result.Err == nil {
+			result.Shared.Do(func(dups int) {
+				g.mainCache.compensateAccess(key, dups)
+			})
 			return result.Val.(ByteView), nil
 		}
 		return ByteView{}, result.Err

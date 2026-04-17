@@ -5,11 +5,11 @@ import (
 	"net"
 )
 
-var ErrNotFound = errors.New("geecache: key not found")
+var ErrNotFound = errors.New("[GCache]: key not found")
 
-var ErrGroupNotFound = errors.New("geecache: group not found")
+var ErrGroupNotFound = errors.New("[GCache]: group not found")
 
-var ErrCircuitOpen = errors.New("geecache: peer circuit open")
+var ErrCircuitOpen = errors.New("[GCache]: peer circuit open")
 
 func isRetryableError(err error) bool {
 	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrGroupNotFound) || errors.Is(err, ErrCircuitOpen) {

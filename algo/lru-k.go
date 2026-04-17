@@ -69,6 +69,33 @@ func (lru *LRUK) OnAccess(key string) {
 	lru.history.MoveToFront(node.element)
 }
 
+func (lru *LRUK) OnBurst(key string, n int) {
+	node, ok := lru.nodes[key]
+	if !ok || n <= 0 {
+		return
+	}
+	if node.inCache {
+		lru.cache.MoveToFront(node.element)
+		return
+	}
+
+	needed := lru.k - node.accesses
+	if needed <= 0 {
+		lru.history.MoveToFront(node.element)
+		return
+	}
+	if n < needed {
+		node.accesses += n
+		lru.history.MoveToFront(node.element)
+		return
+	}
+
+	node.accesses += needed
+	lru.history.Remove(node.element)
+	node.inCache = true
+	node.element = lru.cache.PushFront(node)
+}
+
 func (lru *LRUK) OnRemove(key string) {
 	node, ok := lru.nodes[key]
 	if !ok {

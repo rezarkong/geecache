@@ -2,8 +2,8 @@ package algo
 
 import "sync"
 
-// Evictor controls which key should be evicted next.
-// Cache owns the actual values; the evictor only tracks access patterns.
+// Evictor 作为淘汰选择器
+// Cache 存 key value，Evictor 只选择接触的动作
 // Evict returns a victim key but must not mutate internal state.
 type Evictor interface {
 	OnAdd(key string)
@@ -11,6 +11,12 @@ type Evictor interface {
 	OnRemove(key string)
 	OnEvict(key string)
 	Evict() string
+}
+
+// BurstAware is an optional evictor capability used to compensate
+// for duplicate requests collapsed by singleflight.
+type BurstAware interface {
+	OnBurst(key string, n int)
 }
 
 type Cache struct {
@@ -69,15 +75,20 @@ func (c *Cache) Get(key string) (value Value, ok bool) {
 func (c *Cache) GetOrRemoveIf(key string, predicate func(Value) bool) (value Value, ok bool, removed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
+	// 从cache内找key value
 	value, ok = c.cache[key]
+	// 不存在的话就返回 nil, ok = false
 	if !ok {
 		return nil, false, false
 	}
+	// 如果存在，再调用 predicate(value) 判断这个值要不要删
+	// predicate 调用的是判断 expired
 	if predicate != nil && predicate(value) {
+		// 如果过期就直接 removeKey
 		c.removeKey(key)
 		return nil, false, true
 	}
+	// 否则就提对应优先级
 	c.evictor.OnAccess(key)
 	return value, true, false
 }
@@ -101,6 +112,27 @@ func (c *Cache) RemoveIf(key string, predicate func(Value) bool) bool {
 	}
 	c.removeKey(key)
 	return true
+}
+
+func (c *Cache) CompensateBurstIf(key string, n int, predicate func(Value) bool) (ok bool, removed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	value, ok := c.cache[key]
+	if !ok {
+		return false, false
+	}
+	if predicate != nil && predicate(value) {
+		c.removeKey(key)
+		return false, true
+	}
+	if n <= 0 {
+		return true, false
+	}
+	if aware, ok := c.evictor.(BurstAware); ok {
+		aware.OnBurst(key, n)
+	}
+	return true, false
 }
 
 func (c *Cache) Len() int {

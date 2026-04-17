@@ -19,8 +19,7 @@ const defaultReplicas = 50
 
 // GRPCPool implements PeerPicker for a pool of gRPC peers.
 type GRPCPool struct {
-	self string
-
+	self        string
 	mu          sync.RWMutex
 	peers       *consistenthash.Map
 	grpcGetters map[string]*grpcGetter

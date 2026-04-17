@@ -49,6 +49,16 @@ func (lfu *LFU) OnAccess(key string) {
 	lfu.bump(node)
 }
 
+func (lfu *LFU) OnBurst(key string, n int) {
+	node, ok := lfu.nodes[key]
+	if !ok || n <= 0 {
+		return
+	}
+	for i := 0; i < n; i++ {
+		lfu.bump(node)
+	}
+}
+
 func (lfu *LFU) OnRemove(key string) {
 	node, ok := lfu.nodes[key]
 	if !ok {

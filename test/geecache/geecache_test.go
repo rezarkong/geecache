@@ -196,6 +196,96 @@ func TestGetSingleflight(t *testing.T) {
 	}
 }
 
+func TestGetSingleflightCompensatesLFUBurstHotness(t *testing.T) {
+	const goroutines = 20
+
+	var loads int32
+	gee := geecache.NewGroupWithOptions(
+		"singleflight-lfu-burst",
+		4,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			atomic.AddInt32(&loads, 1)
+			time.Sleep(10 * time.Millisecond)
+			return []byte("1"), nil
+		}),
+		geecache.WithEvictor(func() algo.Evictor { return algo.NewLFU() }),
+	)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := gee.Get("a"); err != nil {
+				t.Errorf("get a: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if _, err := gee.Get("b"); err != nil {
+		t.Fatalf("get b: %v", err)
+	}
+	if _, err := gee.Get("c"); err != nil {
+		t.Fatalf("get c: %v", err)
+	}
+	if _, err := gee.Get("a"); err != nil {
+		t.Fatalf("get cached a: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&loads); got != 3 {
+		t.Fatalf("expected hot key a to stay cached after burst compensation, got %d loads", got)
+	}
+}
+
+func TestGetSingleflightCompensatesLRUKBurstHotness(t *testing.T) {
+	const goroutines = 20
+
+	var loads int32
+	gee := geecache.NewGroupWithOptions(
+		"singleflight-lruk-burst",
+		4,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			atomic.AddInt32(&loads, 1)
+			time.Sleep(10 * time.Millisecond)
+			return []byte("1"), nil
+		}),
+		geecache.WithEvictor(func() algo.Evictor { return algo.NewLRUK(2) }),
+	)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := gee.Get("a"); err != nil {
+				t.Errorf("get a: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if _, err := gee.Get("b"); err != nil {
+		t.Fatalf("get b: %v", err)
+	}
+	if _, err := gee.Get("c"); err != nil {
+		t.Fatalf("get c: %v", err)
+	}
+	if _, err := gee.Get("a"); err != nil {
+		t.Fatalf("get cached a: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&loads); got != 3 {
+		t.Fatalf("expected promoted key a to stay cached after burst compensation, got %d loads", got)
+	}
+}
+
 func TestGetContextSingleflightDoesNotShareCallerCancellation(t *testing.T) {
 	var loads int32
 	gee := geecache.NewGroup("singleflight-context", 2<<10, geecache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
