@@ -25,8 +25,12 @@ var db = map[string]string{
 
 type failingPeerPicker struct{}
 
-func (failingPeerPicker) PickPeer(string) (geecache.PeerGetter, bool) {
-	return failingPeerGetter{}, true
+func (failingPeerPicker) PickPeer(string) (geecache.PeerGetter, bool, bool) {
+	return failingPeerGetter{}, true, false
+}
+
+func (failingPeerPicker) Close() error {
+	return nil
 }
 
 type failingPeerGetter struct{}
@@ -39,8 +43,12 @@ type flakyPeerPicker struct {
 	getter geecache.PeerGetter
 }
 
-func (p flakyPeerPicker) PickPeer(string) (geecache.PeerGetter, bool) {
-	return p.getter, true
+func (p flakyPeerPicker) PickPeer(string) (geecache.PeerGetter, bool, bool) {
+	return p.getter, true, false
+}
+
+func (p flakyPeerPicker) Close() error {
+	return nil
 }
 
 type flakyPeerGetter struct {
@@ -708,6 +716,26 @@ func TestGroupCloseStopsCleanupAndRemovesRegistryEntry(t *testing.T) {
 	time.Sleep(90 * time.Millisecond)
 	if got := group.Stats().CacheExpirations; got != 0 {
 		t.Fatalf("expected closed group cleanup to stop, got expirations=%d", got)
+	}
+}
+
+func TestGroupCloseIsIdempotentAndRejectsReads(t *testing.T) {
+	group := geecache.NewGroup(
+		"closed-group-read",
+		2<<10,
+		geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+			return []byte("value-" + key), nil
+		}),
+	)
+
+	if err := group.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	if err := group.Close(); err != nil {
+		t.Fatalf("second close should be a no-op, got %v", err)
+	}
+	if _, err := group.Get("Tom"); err != geecache.ErrGroupClosed {
+		t.Fatalf("expected ErrGroupClosed after close, got %v", err)
 	}
 }
 

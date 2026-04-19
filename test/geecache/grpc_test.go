@@ -20,16 +20,20 @@ func startTestGRPCServer(t *testing.T, groupName string, getter geecache.Getter)
 	t.Helper()
 
 	geecache.NewGroup(groupName, 2<<10, getter)
-	return startRegisteredGRPCServer(t)
+	return startRegisteredGRPCServerWithPeers(t)
 }
 
-func startRegisteredGRPCServer(t *testing.T) (string, func()) {
+func startRegisteredGRPCServerWithPeers(t *testing.T, peers ...string) (string, func()) {
 	t.Helper()
 
-	pool := geecache.NewGRPCPool("self")
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
+	}
+	self := lis.Addr().String()
+	pool := geecache.NewGRPCPool(self)
+	if len(peers) > 0 {
+		pool.Set(peers...)
 	}
 	server := grpc.NewServer()
 	pool.Register(server)
@@ -39,12 +43,13 @@ func startRegisteredGRPCServer(t *testing.T) (string, func()) {
 	return lis.Addr().String(), func() {
 		server.Stop()
 		_ = lis.Close()
+		_ = pool.Close()
 	}
 }
 
 func startBareTestGRPCServer(t *testing.T) (string, func()) {
 	t.Helper()
-	return startRegisteredGRPCServer(t)
+	return startRegisteredGRPCServerWithPeers(t)
 }
 
 type countingPeerPicker struct {
@@ -52,9 +57,13 @@ type countingPeerPicker struct {
 	getter geecache.PeerGetter
 }
 
-func (p *countingPeerPicker) PickPeer(string) (geecache.PeerGetter, bool) {
+func (p *countingPeerPicker) PickPeer(string) (geecache.PeerGetter, bool, bool) {
 	atomic.AddInt32(&p.calls, 1)
-	return p.getter, true
+	return p.getter, true, false
+}
+
+func (p *countingPeerPicker) Close() error {
+	return nil
 }
 
 type staticPeerGetter struct {
@@ -74,8 +83,8 @@ func TestGRPCGetterFetchesFromPeer(t *testing.T) {
 
 	pool := geecache.NewGRPCPool("self")
 	pool.Set(addr)
-	getter, ok := pool.PickPeer("Tom")
-	if !ok {
+	getter, ok, self := pool.PickPeer("Tom")
+	if !ok || self {
 		t.Fatal("expected peer getter")
 	}
 	var out pb.Response
@@ -89,7 +98,7 @@ func TestGRPCGetterFetchesFromPeer(t *testing.T) {
 
 func TestGRPCPoolPickPeerBeforeSet(t *testing.T) {
 	pool := geecache.NewGRPCPool("self")
-	if peer, ok := pool.PickPeer("Tom"); ok || peer != nil {
+	if peer, ok, self := pool.PickPeer("Tom"); ok || self || peer != nil {
 		t.Fatalf("expected no peer before Set")
 	}
 }
@@ -121,8 +130,8 @@ func TestGRPCGetterPropagatesPeerError(t *testing.T) {
 
 	pool := geecache.NewGRPCPool("self")
 	pool.Set(addr)
-	getter, ok := pool.PickPeer("Tom")
-	if !ok {
+	getter, ok, self := pool.PickPeer("Tom")
+	if !ok || self {
 		t.Fatal("expected peer getter")
 	}
 	err := getter.Get(context.Background(), &pb.Request{Group: groupName, Key: "Tom"}, &pb.Response{})
@@ -140,8 +149,8 @@ func TestGRPCGetterReturnsNotFound(t *testing.T) {
 
 	pool := geecache.NewGRPCPool("self")
 	pool.Set(addr)
-	getter, ok := pool.PickPeer("Tom")
-	if !ok {
+	getter, ok, self := pool.PickPeer("Tom")
+	if !ok || self {
 		t.Fatal("expected peer getter")
 	}
 	err := getter.Get(context.Background(), &pb.Request{Group: groupName, Key: "Tom"}, &pb.Response{})
@@ -160,13 +169,13 @@ func TestGRPCServerGetDoesNotForwardToOtherPeers(t *testing.T) {
 	picker := &countingPeerPicker{getter: staticPeerGetter{err: fmt.Errorf("unexpected peer forward")}}
 	group.RegisterPeers(picker)
 
-	addr, cleanup := startRegisteredGRPCServer(t)
+	addr, cleanup := startRegisteredGRPCServerWithPeers(t)
 	defer cleanup()
 
 	pool := geecache.NewGRPCPool("self")
 	pool.Set(addr)
-	getter, ok := pool.PickPeer("Tom")
-	if !ok {
+	getter, ok, self := pool.PickPeer("Tom")
+	if !ok || self {
 		t.Fatal("expected peer getter")
 	}
 
@@ -182,14 +191,58 @@ func TestGRPCServerGetDoesNotForwardToOtherPeers(t *testing.T) {
 	}
 }
 
+func TestGRPCGetterReturnsPeerViewMismatch(t *testing.T) {
+	groupName := "grpc-peer-view-mismatch"
+	geecache.NewGroup(groupName, 2<<10, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		return []byte("remote-" + key), nil
+	}))
+
+	addr, cleanup := startRegisteredGRPCServerWithPeers(t, "peer-a", "peer-b")
+	defer cleanup()
+
+	pool := geecache.NewGRPCPool("self")
+	pool.Set(addr)
+	getter, ok, self := pool.PickPeer("Tom")
+	if !ok || self {
+		t.Fatal("expected remote peer getter")
+	}
+
+	err := getter.Get(context.Background(), &pb.Request{Group: groupName, Key: "Tom"}, &pb.Response{})
+	if !errors.Is(err, geecache.ErrPeerViewMismatch) {
+		t.Fatalf("expected ErrPeerViewMismatch, got %v", err)
+	}
+}
+
+func TestGroupFallsBackLocallyOnPeerViewMismatch(t *testing.T) {
+	var localLoads int32
+	group := geecache.NewGroup("peer-view-fallback", 2<<10, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&localLoads, 1)
+		return []byte("local-" + key), nil
+	}))
+	defer group.Close()
+
+	group.RegisterPeers(&countingPeerPicker{getter: staticPeerGetter{err: geecache.ErrPeerViewMismatch}})
+
+	view, err := group.Get("Tom")
+	if err != nil {
+		t.Fatalf("expected local fallback, got %v", err)
+	}
+	if got := view.String(); got != "local-Tom" {
+		t.Fatalf("unexpected value %q", got)
+	}
+	if got := atomic.LoadInt32(&localLoads); got != 1 {
+		t.Fatalf("expected one local fallback load, got %d", got)
+	}
+}
+
 func TestGRPCGetterReturnsGroupNotFound(t *testing.T) {
 	addr, cleanup := startBareTestGRPCServer(t)
 	defer cleanup()
 
 	pool := geecache.NewGRPCPool("self")
 	pool.Set(addr)
-	getter, ok := pool.PickPeer("Tom")
-	if !ok {
+	getter, ok, self := pool.PickPeer("Tom")
+	if !ok || self {
 		t.Fatal("expected peer getter")
 	}
 

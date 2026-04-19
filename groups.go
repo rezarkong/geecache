@@ -59,6 +59,10 @@ type Group struct {
 	closed               atomic.Bool
 }
 
+type peerPickerCloser interface {
+	Close() error
+}
+
 var (
 	mu     sync.RWMutex              // 对应 group 的读写锁
 	groups = make(map[string]*Group) // Group
@@ -66,6 +70,12 @@ var (
 
 // RegisterPeers registers a PeerPicker for choosing remote peer
 func (g *Group) RegisterPeers(peers PeerPicker) {
+	if g.closed.Load() {
+		if peers != nil {
+			_ = peers.Close()
+		}
+		return
+	}
 	g.peersMu.Lock()
 	defer g.peersMu.Unlock()
 	if g.peers != nil {
@@ -121,27 +131,45 @@ func (g *Group) Stats() StatsSnapshot {
 
 // Delete cache 删除某个或某些 key
 func (g *Group) Delete(keys ...string) {
+	if g.closed.Load() {
+		return
+	}
 	g.mainCache.delete(keys...)
 }
 
 // Clear 清空当前 group 的本地缓存
 func (g *Group) Clear() {
+	if g.closed.Load() {
+		return
+	}
 	g.mainCache.clear()
 }
 
 // Close 关闭 group
-func (g *Group) Close() {
-	if g.closed.Load() == true {
-		panic("group already closed")
+func (g *Group) Close() error {
+	if !g.closed.CompareAndSwap(false, true) {
+		return nil
 	}
 
 	mu.Lock()
-	g.closed.Store(true)
 	if current := groups[g.name]; current == g {
 		delete(groups, g.name)
 	}
 	mu.Unlock()
 	g.stopCleanup()
+	g.mainCache.clear()
+
+	g.peersMu.Lock()
+	peers := g.peers
+	g.peers = nil
+	g.peersMu.Unlock()
+
+	if peers != nil {
+		if closer, ok := peers.(peerPickerCloser); ok {
+			return closer.Close()
+		}
+	}
+	return nil
 }
 
 // GetGroup 返回 name 对应的 Group，没有就返回 nil
@@ -163,19 +191,22 @@ func DeleteGroup(name string) bool {
 	if g == nil {
 		return false
 	}
-	g.stopCleanup()
+	_ = g.Close()
 	return true
 }
 
 // 本地缓存未命中 进 load 里面找
 func (g *Group) load(ctx context.Context, key string, loader *singleflight.Group,
 	loadFn func(context.Context, string) (ByteView, error)) (value ByteView, err error) {
+	if g.closed.Load() {
+		return ByteView{}, ErrGroupClosed
+	}
 	// 当前调用者自己的 ctx 可以取消，但是共享的那次真实加载不要因为某一个调用者取消就被杀掉
 	// 这样可以避免热点 key 并发场景下，第一个请求超时后把整次共享加载都中断掉
 	loadCtx := context.WithoutCancel(ctx)
 	// 利用 singleflight, 同一个 key，同一时刻只有一次 loadFn(loadCtx, key) 会真正执行
 	// 其余并发请求不会重复加载
-	// 它们都共享这次加载的结果
+	// 它们都共享这次加载的结果，记录 key 的访问次数，并发后进行热度补偿
 	resultCh := loader.DoChan(key, func() (interface{}, error) {
 		return loadFn(loadCtx, key)
 	})
@@ -194,6 +225,9 @@ func (g *Group) load(ctx context.Context, key string, loader *singleflight.Group
 }
 
 func (g *Group) get(ctx context.Context, key string, loader *singleflight.Group, loadFn func(context.Context, string) (ByteView, error)) (ByteView, error) {
+	if g.closed.Load() {
+		return ByteView{}, ErrGroupClosed
+	}
 	if key == "" {
 		return ByteView{}, fmt.Errorf("key is required")
 	}
@@ -248,18 +282,21 @@ func identifyPeer(peer PeerGetter) string {
 }
 
 // 找 key 在哪个 peer 上
-func (g *Group) pickPeer(key string) (PeerGetter, string, bool) {
+func (g *Group) pickPeer(key string) (PeerGetter, string, bool, bool) {
 	g.peersMu.RLock()
 	peers := g.peers
 	g.peersMu.RUnlock()
 	if peers == nil {
-		return nil, "", false
+		return nil, "", false, false
 	}
-	peer, ok := peers.PickPeer(key)
+	peer, ok, self := peers.PickPeer(key)
 	if !ok {
-		return nil, "", false
+		return nil, "", false, false
 	}
-	return peer, identifyPeer(peer), true
+	if self {
+		return nil, "", true, true
+	}
+	return peer, identifyPeer(peer), true, false
 }
 
 // onPeerSuccess 某个 peer 请求成功后，重置这个 peer 的失败/熔断状态
@@ -346,9 +383,12 @@ func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (B
 // loadFromPeer 在真正回本地数据源之前，先看看这个 key 是不是应该去别的 peer 节点取
 func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, bool) {
 	// 先通过 key 判断从哪个节点来获取对应的 k-v
-	peer, peerID, ok := g.pickPeer(key)
+	peer, peerID, ok, self := g.pickPeer(key)
 
 	if !ok {
+		return ByteView{}, nil, false
+	}
+	if self {
 		return ByteView{}, nil, false
 	}
 	// 如果熔断了就报错
@@ -385,6 +425,12 @@ func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, 
 		log.Println("[GCache] Peer is missing group", err)
 		return ByteView{}, err, true
 	}
+	if errors.Is(err, ErrPeerViewMismatch) || errors.Is(err, ErrGroupClosed) {
+		g.stats.addPeerFailures(1)
+		g.onPeerFailure(peerID)
+		log.Println("[GCache] Peer rejected request", err)
+		return ByteView{}, nil, false
+	}
 
 	g.stats.addPeerFailures(1)
 	g.onPeerFailure(peerID)
@@ -394,6 +440,9 @@ func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, 
 
 // getLocally 真正执行本地回源并回填缓存的函数
 func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
+	if g.closed.Load() {
+		return ByteView{}, ErrGroupClosed
+	}
 	g.stats.addLocalLoads(1)
 	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {

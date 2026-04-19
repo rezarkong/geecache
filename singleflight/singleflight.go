@@ -32,7 +32,7 @@ type call struct {
 	wg     sync.WaitGroup // 维护有多少请求调用这个 key
 	val    interface{}    // 维护 val
 	err    error          // 维护 nil 值
-	dups   int            // 重复请求数量，不包含首个执行者
+	dups   int            // 重复请求数量，不包含首个请求
 	shared *Shared
 }
 
