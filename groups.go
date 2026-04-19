@@ -59,10 +59,6 @@ type Group struct {
 	closed               atomic.Bool
 }
 
-type peerPickerCloser interface {
-	Close() error
-}
-
 var (
 	mu     sync.RWMutex              // 对应 group 的读写锁
 	groups = make(map[string]*Group) // Group
@@ -71,9 +67,6 @@ var (
 // RegisterPeers registers a PeerPicker for choosing remote peer
 func (g *Group) RegisterPeers(peers PeerPicker) {
 	if g.closed.Load() {
-		if peers != nil {
-			_ = peers.Close()
-		}
 		return
 	}
 	g.peersMu.Lock()
@@ -158,17 +151,6 @@ func (g *Group) Close() error {
 	mu.Unlock()
 	g.stopCleanup()
 	g.mainCache.clear()
-
-	g.peersMu.Lock()
-	peers := g.peers
-	g.peers = nil
-	g.peersMu.Unlock()
-
-	if peers != nil {
-		if closer, ok := peers.(peerPickerCloser); ok {
-			return closer.Close()
-		}
-	}
 	return nil
 }
 

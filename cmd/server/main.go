@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"geecache"
 	"geecache/algo"
+	"geecache/registry"
 	"io"
 	"log"
 	"net"
@@ -64,7 +65,17 @@ type peersPayload struct {
 	Peers []string `json:"peers"`
 }
 
-func startAPIServer(apiAddr string, group *geecache.Group, pool *geecache.GRPCPool) {
+type peerManager interface {
+	geecache.PeerPicker
+	Register(*grpc.Server)
+	Peers() []string
+}
+
+type peerConfigurator interface {
+	Set(peers ...string)
+}
+
+func startAPIServer(apiAddr string, group *geecache.Group, peers peerManager) error {
 	mux := http.NewServeMux()
 	mux.Handle("/api", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.URL.Query().Get("key")
@@ -73,6 +84,8 @@ func startAPIServer(apiAddr string, group *geecache.Group, pool *geecache.GRPCPo
 			status := http.StatusInternalServerError
 			if err == geecache.ErrNotFound {
 				status = http.StatusNotFound
+			} else if err == geecache.ErrGroupClosed {
+				status = http.StatusServiceUnavailable
 			}
 			http.Error(w, err.Error(), status)
 			return
@@ -88,8 +101,13 @@ func startAPIServer(apiAddr string, group *geecache.Group, pool *geecache.GRPCPo
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(peersPayload{Peers: pool.Peers()})
+			_ = json.NewEncoder(w).Encode(peersPayload{Peers: peers.Peers()})
 		case http.MethodPost:
+			manager, ok := peers.(peerConfigurator)
+			if !ok {
+				http.Error(w, "peer list is managed dynamically", http.StatusConflict)
+				return
+			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -104,31 +122,31 @@ func startAPIServer(apiAddr string, group *geecache.Group, pool *geecache.GRPCPo
 				http.Error(w, "peers is required", http.StatusBadRequest)
 				return
 			}
-			pool.Set(payload.Peers...)
+			manager.Set(payload.Peers...)
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(peersPayload{Peers: pool.Peers()})
+			_ = json.NewEncoder(w).Encode(peersPayload{Peers: peers.Peers()})
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	}))
 
 	log.Println("frontend server is running at", apiAddr)
-	log.Fatal(http.ListenAndServe(apiAddr, mux))
+	return http.ListenAndServe(apiAddr, mux)
 }
 
-func startCacheServer(addr string, pool *geecache.GRPCPool) {
+func startCacheServer(addr string, peers peerManager) error {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	server := grpc.NewServer()
-	pool.Register(server)
+	peers.Register(server)
 
 	log.Println("geecache grpc server is running at", addr)
-	log.Fatal(server.Serve(lis))
+	return server.Serve(lis)
 }
 
-func splitPeers(raw string) []string {
+func splitList(raw string) []string {
 	parts := strings.Split(raw, ",")
 	peers := make([]string, 0, len(parts))
 	for _, peer := range parts {
@@ -145,6 +163,9 @@ func main() {
 	var (
 		addr        string
 		peers       string
+		useEtcd     bool
+		etcd        string
+		serviceName string
 		api         bool
 		apiAddr     string
 		emptyTTL    time.Duration
@@ -154,6 +175,9 @@ func main() {
 
 	flag.StringVar(&addr, "addr", "localhost:8001", "Current cache node address")
 	flag.StringVar(&peers, "peers", "localhost:8001,localhost:8002,localhost:8003", "Comma-separated cache peers")
+	flag.BoolVar(&useEtcd, "use-etcd", false, "Use etcd service discovery instead of the static peer list")
+	flag.StringVar(&etcd, "etcd-endpoints", "localhost:2379", "Comma-separated etcd endpoints")
+	flag.StringVar(&serviceName, "service-name", registry.DefaultServiceName, "Service name used for etcd registration/discovery")
 	flag.BoolVar(&api, "api", false, "Start an API server")
 	flag.StringVar(&apiAddr, "api-addr", "localhost:9999", "API server listen address")
 	flag.DurationVar(&emptyTTL, "empty-ttl", 30*time.Second, "TTL for not-found cache entries")
@@ -161,18 +185,54 @@ func main() {
 	flag.StringVar(&evictor, "evictor", "lru", "Cache eviction algorithm: lru, lfu, lru-k, or arc")
 	flag.Parse()
 
-	peerList := splitPeers(peers)
-	if len(peerList) == 0 {
-		log.Fatal("at least one peer address is required")
-	}
-
 	group := createGroup(emptyTTL, peerRetries, evictor)
-	pool := geecache.NewGRPCPool(addr)
-	pool.Set(peerList...)
-	group.RegisterPeers(pool)
-	if api {
-		go startAPIServer(apiAddr, group, pool)
+	var (
+		manager      peerManager
+		registration *registry.Registration
+	)
+	if useEtcd {
+		endpoints := splitList(etcd)
+		picker, err := geecache.NewEtcdPicker(addr, endpoints, serviceName)
+		if err != nil {
+			log.Fatalf("create etcd picker: %v", err)
+		}
+		manager = picker
+		registration, err = registry.Register(registry.Config{
+			Endpoints:   endpoints,
+			ServiceName: serviceName,
+		}, addr)
+		if err != nil {
+			_ = manager.Close()
+			log.Fatalf("register service in etcd: %v", err)
+		}
+		defer registration.Close()
+	} else {
+		peerList := splitList(peers)
+		if len(peerList) == 0 {
+			log.Fatal("at least one peer address is required")
+		}
+		pool := geecache.NewGRPCPool(addr)
+		pool.Set(peerList...)
+		manager = pool
 	}
-	fmt.Printf("node=%s peers=%v emptyTTL=%s peerRetries=%d evictor=%s\n", addr, peerList, emptyTTL, peerRetries, evictor)
-	startCacheServer(addr, pool)
+	defer manager.Close()
+
+	group.RegisterPeers(manager)
+	if api {
+		go func() {
+			if err := startAPIServer(apiAddr, group, manager); err != nil {
+				log.Printf("api server stopped: %v", err)
+			}
+		}()
+	}
+	if useEtcd {
+		fmt.Printf("node=%s discovery=etcd etcd=%v service=%s emptyTTL=%s peerRetries=%d evictor=%s\n",
+			addr, splitList(etcd), serviceName, emptyTTL, peerRetries, evictor)
+	} else {
+		fmt.Printf("node=%s peers=%v emptyTTL=%s peerRetries=%d evictor=%s\n",
+			addr, splitList(peers), emptyTTL, peerRetries, evictor)
+	}
+	if err := startCacheServer(addr, manager); err != nil {
+		log.Printf("cache server stopped: %v", err)
+	}
 }

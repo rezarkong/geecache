@@ -22,6 +22,10 @@ const defaultReplicas = 50
 
 const peerViewHeader = "x-geecache-peer-view"
 
+type peerViewSource interface {
+	currentPeerView() string
+}
+
 // GRPCPool implements PeerPicker for a pool of gRPC peers.
 type GRPCPool struct {
 	self        string
@@ -97,7 +101,7 @@ func (p *GRPCPool) PickPeer(key string) (PeerGetter, bool, bool) {
 
 // Register registers the cache service on a grpc.Server.
 func (p *GRPCPool) Register(server *grpc.Server) {
-	pb.RegisterGroupCacheServer(server, &groupCacheServer{pool: p})
+	registerGroupCacheServer(server, p)
 }
 
 func (p *GRPCPool) Close() error {
@@ -125,7 +129,7 @@ func (p *GRPCPool) currentPeerView() string {
 var _ PeerPicker = (*GRPCPool)(nil)
 
 type groupCacheServer struct {
-	pool *GRPCPool
+	pool peerViewSource
 	pb.UnimplementedGroupCacheServer
 }
 
@@ -264,4 +268,8 @@ func peerViewFromIncomingContext(ctx context.Context) string {
 		return ""
 	}
 	return values[0]
+}
+
+func registerGroupCacheServer(server *grpc.Server, pool peerViewSource) {
+	pb.RegisterGroupCacheServer(server, &groupCacheServer{pool: pool})
 }
