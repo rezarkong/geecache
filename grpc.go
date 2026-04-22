@@ -8,7 +8,6 @@ import (
 	pb "geecache/geecachepb"
 	"log"
 	"sort"
-	"strings"
 	"sync"
 
 	"google.golang.org/grpc"
@@ -29,15 +28,28 @@ type peerViewSource interface {
 // GRPCPool implements PeerPicker for a pool of gRPC peers.
 type GRPCPool struct {
 	self        string
+	dialOptions []grpc.DialOption
 	mu          sync.RWMutex
 	peers       *consistenthash.Map
 	grpcGetters map[string]*grpcGetter
+	members     map[string]weightedPeer
 	peerView    string
 }
 
 // NewGRPCPool 初始化 Peers 的 Pool
 func NewGRPCPool(self string) *GRPCPool {
-	return &GRPCPool{self: self}
+	return NewGRPCPoolWithOptions(self, nil)
+}
+
+// NewGRPCPoolWithOptions creates a peer pool with custom dial options.
+func NewGRPCPoolWithOptions(self string, dialOptions []grpc.DialOption) *GRPCPool {
+	if len(dialOptions) == 0 {
+		dialOptions = []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	}
+	return &GRPCPool{
+		self:        self,
+		dialOptions: append([]grpc.DialOption(nil), dialOptions...),
+	}
 }
 
 // Log server 的日志
@@ -50,17 +62,22 @@ func (p *GRPCPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	next := make(map[string]*grpcGetter, len(peers))
+	weightedPeers := uniqueWeightedPeers(peers)
+	next := make(map[string]*grpcGetter, len(weightedPeers))
 	p.peers = consistenthash.New(defaultReplicas, nil)
-	p.peers.Add(peers...)
-	for _, peer := range peers {
+	p.peers.AddMembers(toHashMembers(weightedPeers)...)
+	for _, peer := range weightedPeers {
 		if p.grpcGetters != nil {
-			if getter, ok := p.grpcGetters[peer]; ok {
-				next[peer] = getter
+			if getter, ok := p.grpcGetters[peer.Addr]; ok {
+				next[peer.Addr] = getter
 				continue
 			}
 		}
-		next[peer] = &grpcGetter{addr: peer, peerView: p.currentPeerView}
+		next[peer.Addr] = &grpcGetter{
+			addr:        peer.Addr,
+			peerView:    p.currentPeerView,
+			dialOptions: append([]grpc.DialOption(nil), p.dialOptions...),
+		}
 	}
 	for peer, getter := range p.grpcGetters {
 		if _, ok := next[peer]; !ok {
@@ -68,17 +85,22 @@ func (p *GRPCPool) Set(peers ...string) {
 		}
 	}
 	p.grpcGetters = next
-	p.peerView = normalizePeerView(peers)
+	p.members = make(map[string]weightedPeer, len(weightedPeers))
+	for _, peer := range weightedPeers {
+		p.members[peer.Addr] = peer
+	}
+	p.peerView = normalizePeerView(weightedPeers)
 }
 
 // Peers returns a copy of the current peer list.
 func (p *GRPCPool) Peers() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	peers := make([]string, 0, len(p.grpcGetters))
-	for peer := range p.grpcGetters {
-		peers = append(peers, peer)
+	peers := make([]string, 0, len(p.members))
+	for _, peer := range p.members {
+		peers = append(peers, formatPeerSpec(peer))
 	}
+	sort.Strings(peers)
 	return peers
 }
 
@@ -104,6 +126,17 @@ func (p *GRPCPool) Register(server *grpc.Server) {
 	registerGroupCacheServer(server, p)
 }
 
+func (p *GRPCPool) Self() string {
+	return p.self
+}
+
+func (p *GRPCPool) PeerByAddr(addr string) (mutationPeer, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	getter, ok := p.grpcGetters[addr]
+	return getter, ok
+}
+
 func (p *GRPCPool) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -116,6 +149,7 @@ func (p *GRPCPool) Close() error {
 	}
 	p.grpcGetters = nil
 	p.peers = nil
+	p.members = nil
 	p.peerView = ""
 	return firstErr
 }
@@ -161,7 +195,8 @@ func (s *groupCacheServer) Get(ctx context.Context, req *pb.Request) (*pb.Respon
 }
 
 type grpcGetter struct {
-	addr string
+	addr        string
+	dialOptions []grpc.DialOption
 
 	peerView func() string
 
@@ -179,11 +214,7 @@ func (h *grpcGetter) Get(ctx context.Context, in *pb.Request, out *pb.Response) 
 	if err != nil {
 		return err
 	}
-	if h.peerView != nil {
-		if view := h.peerView(); view != "" {
-			ctx = metadata.AppendToOutgoingContext(ctx, peerViewHeader, view)
-		}
-	}
+	ctx = h.withPeerView(ctx)
 	resp, err := client.Get(ctx, in)
 	if err != nil {
 		switch status.Code(err) {
@@ -200,6 +231,18 @@ func (h *grpcGetter) Get(ctx context.Context, in *pb.Request, out *pb.Response) 
 	}
 	*out = *resp
 	return nil
+}
+
+func (h *grpcGetter) Set(ctx context.Context, req mutationRequest) error {
+	return h.invokeMutation(ctx, mutationSetFullMethodName, req)
+}
+
+func (h *grpcGetter) Delete(ctx context.Context, req mutationRequest) error {
+	return h.invokeMutation(ctx, mutationDeleteFullMethodName, req)
+}
+
+func (h *grpcGetter) Invalidate(ctx context.Context, req mutationRequest) error {
+	return h.invokeMutation(ctx, mutationInvalidateFullMethodName, req)
 }
 
 func (h *grpcGetter) Close() error {
@@ -223,7 +266,7 @@ func (h *grpcGetter) clientFor(ctx context.Context) (pb.GroupCacheClient, error)
 
 	conn, err := grpc.NewClient(
 		h.addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		h.dialOptions...,
 	)
 	if err != nil {
 		return nil, err
@@ -234,28 +277,53 @@ func (h *grpcGetter) clientFor(ctx context.Context) (pb.GroupCacheClient, error)
 }
 
 var _ PeerGetter = (*grpcGetter)(nil)
+var _ mutationPeer = (*grpcGetter)(nil)
 
-func normalizePeerView(peers []string) string {
-	if len(peers) == 0 {
-		return ""
+func (h *grpcGetter) invokeMutation(ctx context.Context, method string, req mutationRequest) error {
+	conn, err := h.connFor(ctx)
+	if err != nil {
+		return err
 	}
-	seen := make(map[string]struct{}, len(peers))
-	items := make([]string, 0, len(peers))
-	for _, peer := range peers {
-		if peer == "" {
-			continue
-		}
-		if _, ok := seen[peer]; ok {
-			continue
-		}
-		seen[peer] = struct{}{}
-		items = append(items, peer)
+	ctx = h.withPeerView(ctx)
+	var resp mutationResponse
+	err = conn.Invoke(ctx, method, &req, &resp, grpc.CallContentSubtype(mutationCodecName))
+	if err == nil {
+		return nil
 	}
-	if len(items) == 0 {
-		return ""
+	switch status.Code(err) {
+	case codes.NotFound:
+		return ErrNotFound
+	case codes.FailedPrecondition:
+		return fmt.Errorf("%w: %s", ErrGroupNotFound, status.Convert(err).Message())
+	case codes.Aborted:
+		return ErrPeerViewMismatch
+	case codes.Unavailable:
+		return ErrGroupClosed
 	}
-	sort.Strings(items)
-	return strings.Join(items, ",")
+	return err
+}
+
+func (h *grpcGetter) connFor(ctx context.Context) (*grpc.ClientConn, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.conn != nil {
+		return h.conn, nil
+	}
+
+	conn, err := grpc.NewClient(h.addr, h.dialOptions...)
+	if err != nil {
+		return nil, err
+	}
+	h.conn = conn
+	h.client = pb.NewGroupCacheClient(conn)
+	return h.conn, nil
+}
+
+func (h *grpcGetter) withPeerView(ctx context.Context) context.Context {
+	if h.peerView == nil {
+		return ctx
+	}
+	return withPeerView(ctx, h.peerView())
 }
 
 func peerViewFromIncomingContext(ctx context.Context) string {
@@ -271,5 +339,7 @@ func peerViewFromIncomingContext(ctx context.Context) string {
 }
 
 func registerGroupCacheServer(server *grpc.Server, pool peerViewSource) {
-	pb.RegisterGroupCacheServer(server, &groupCacheServer{pool: pool})
+	srv := &groupCacheServer{pool: pool}
+	pb.RegisterGroupCacheServer(server, srv)
+	registerMutationService(server, srv)
 }

@@ -11,6 +11,7 @@ type StatsSnapshot struct {
 	PeerFailures     int64   `json:"peer_failures"`
 	LocalLoads       int64   `json:"local_loads"`
 	EmptyHits        int64   `json:"empty_hits"`
+	BloomRejects     int64   `json:"bloom_rejects"`
 	CacheExpirations int64   `json:"cache_expirations"`
 	HitRate          float64 `json:"hit_rate"`
 }
@@ -23,6 +24,7 @@ type Stats struct {
 	peerFailures     int64
 	localLoads       int64
 	emptyHits        int64
+	bloomRejects     int64
 	cacheExpirations int64
 }
 
@@ -44,6 +46,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		PeerFailures:     atomic.LoadInt64(&s.peerFailures),
 		LocalLoads:       atomic.LoadInt64(&s.localLoads),
 		EmptyHits:        atomic.LoadInt64(&s.emptyHits),
+		BloomRejects:     atomic.LoadInt64(&s.bloomRejects),
 		CacheExpirations: atomic.LoadInt64(&s.cacheExpirations),
 		HitRate:          hitRate,
 	}
@@ -75,6 +78,10 @@ func (s *Stats) addLocalLoads(delta int64) {
 
 func (s *Stats) addEmptyHits(delta int64) {
 	atomic.AddInt64(&s.emptyHits, delta)
+}
+
+func (s *Stats) addBloomRejects(delta int64) {
+	atomic.AddInt64(&s.bloomRejects, delta)
 }
 
 func (s *Stats) addCacheExpirations(delta int64) {

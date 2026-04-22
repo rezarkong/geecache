@@ -25,6 +25,31 @@ func WithShards(count int) Option {
 	}
 }
 
+// WithStoreFactory replaces the default shard-local store implementation.
+func WithStoreFactory(factory StoreFactory) Option {
+	return func(g *Group) {
+		if factory != nil {
+			g.mainCache.newStore = factory
+		}
+	}
+}
+
+// WithBloomFilter attaches a bloom filter to the group.
+func WithBloomFilter(filter BloomFilter) Option {
+	return func(g *Group) {
+		if filter != nil {
+			g.bloom = filter
+		}
+	}
+}
+
+// WithBloomRejectOnMiss rejects keys that are definitely absent from the bloom filter.
+func WithBloomRejectOnMiss() Option {
+	return func(g *Group) {
+		g.bloomRejectOnMiss = true
+	}
+}
+
 // WithCacheTTL sets TTL for normal cache entries and optional positive jitter.
 func WithCacheTTL(ttl, jitter time.Duration) Option {
 	return func(g *Group) {

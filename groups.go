@@ -43,10 +43,12 @@ type Group struct {
 	peerRetries      int                 // peerRetries 设置 peer 抓取失败后重试的次数，失败后调用 localLoader
 	peerRetryBackoff time.Duration       // peerRetryBackoff 两次重试调用之间间隔时间
 	// emptyTTL caches ErrNotFound values for a short period.
-	emptyTTL        time.Duration // emptyTTL 空值缓存 TTL 的时间，用于防缓存击穿
-	cacheTTL        time.Duration // cacheTTL 缓存值活多久
-	cacheTTLJitter  time.Duration // cacheTTLJitter 缓存值过期时间加的随机值，用于防缓存雪崩
-	cleanupInterval time.Duration
+	emptyTTL          time.Duration // emptyTTL 空值缓存 TTL 的时间，用于防缓存击穿
+	cacheTTL          time.Duration // cacheTTL 缓存值活多久
+	cacheTTLJitter    time.Duration // cacheTTLJitter 缓存值过期时间加的随机值，用于防缓存雪崩
+	cleanupInterval   time.Duration
+	bloom             BloomFilter
+	bloomRejectOnMiss bool
 	// circuit breaker state for peer fetches.
 	peerFailureThreshold int                          // peerFailureThreshold peer 连续失败多少次后触发熔断
 	peerCircuitOpen      time.Duration                // peerCircuitOpen 熔断打开后，保持多久不再访问这个 peer
@@ -122,12 +124,114 @@ func (g *Group) Stats() StatsSnapshot {
 	return g.stats.Snapshot()
 }
 
+// AddBloomKeys preloads known keys into the bloom filter.
+func (g *Group) AddBloomKeys(keys ...string) {
+	if g == nil || g.closed.Load() || g.bloom == nil {
+		return
+	}
+	for _, key := range keys {
+		g.bloomAdd(key)
+	}
+}
+
+// Set writes a value to the owner node's cache and invalidates stale replicas.
+func (g *Group) Set(key string, value []byte) error {
+	return g.SetContext(context.Background(), key, value)
+}
+
+// SetContext writes a value to the owner node's cache and invalidates stale replicas.
+func (g *Group) SetContext(ctx context.Context, key string, value []byte) error {
+	if g.closed.Load() {
+		return ErrGroupClosed
+	}
+	if key == "" {
+		return fmt.Errorf("key is required")
+	}
+	if len(value) == 0 {
+		return fmt.Errorf("value is required")
+	}
+
+	peer, peerID, ok, self := g.pickPeer(key)
+	req := mutationRequest{Group: g.name, Key: key, Value: cloneBytes(value)}
+	switch {
+	case ok && !self:
+		mutator, ok := peer.(mutationPeer)
+		if !ok {
+			return fmt.Errorf("peer %s does not support mutations", peerID)
+		}
+		if err := mutator.Set(ctx, req); err != nil {
+			return err
+		}
+		g.mainCache.delete(key)
+		return g.broadcastInvalidate(ctx, key, peerID)
+	default:
+		if err := g.applySet(key, req.Value); err != nil {
+			return err
+		}
+		return g.broadcastInvalidate(ctx, key)
+	}
+}
+
 // Delete cache 删除某个或某些 key
 func (g *Group) Delete(keys ...string) {
 	if g.closed.Load() {
 		return
 	}
 	g.mainCache.delete(keys...)
+}
+
+// DeleteFromCluster removes a key from the owner node and invalidates every replica cache.
+func (g *Group) DeleteFromCluster(key string) error {
+	return g.DeleteFromClusterContext(context.Background(), key)
+}
+
+// DeleteFromClusterContext removes a key from the owner node and invalidates every replica cache.
+func (g *Group) DeleteFromClusterContext(ctx context.Context, key string) error {
+	if g.closed.Load() {
+		return ErrGroupClosed
+	}
+	if key == "" {
+		return fmt.Errorf("key is required")
+	}
+
+	peer, peerID, ok, self := g.pickPeer(key)
+	req := mutationRequest{Group: g.name, Key: key}
+	switch {
+	case ok && !self:
+		mutator, ok := peer.(mutationPeer)
+		if !ok {
+			return fmt.Errorf("peer %s does not support mutations", peerID)
+		}
+		if err := mutator.Delete(ctx, req); err != nil {
+			return err
+		}
+		g.mainCache.delete(key)
+		return g.broadcastInvalidate(ctx, key, peerID)
+	default:
+		if err := g.applyDelete(key); err != nil {
+			return err
+		}
+		return g.broadcastInvalidate(ctx, key)
+	}
+}
+
+// Invalidate removes one key from every reachable cache replica.
+func (g *Group) Invalidate(key string) error {
+	return g.InvalidateContext(context.Background(), key)
+}
+
+// InvalidateContext removes one key from every reachable cache replica.
+func (g *Group) InvalidateContext(ctx context.Context, key string) error {
+	if g.closed.Load() {
+		return ErrGroupClosed
+	}
+	if key == "" {
+		return fmt.Errorf("key is required")
+	}
+	if err := g.applyDelete(key); err != nil {
+		return err
+	}
+	return g.broadcastInvalidate(ctx, key)
 }
 
 // Clear 清空当前 group 的本地缓存
@@ -315,6 +419,17 @@ func (g *Group) randomJitter() time.Duration {
 	return time.Duration(rand.Int63n(int64(g.cacheTTLJitter)))
 }
 
+func (g *Group) bloomAdd(key string) {
+	if g == nil || g.bloom == nil || key == "" {
+		return
+	}
+	g.bloom.Add(key)
+}
+
+func (g *Group) shouldRejectByBloom(key string) bool {
+	return g != nil && g.bloom != nil && g.bloomRejectOnMiss && key != "" && !g.bloom.MightContain(key)
+}
+
 // populateCacheEntry 本地缓存加入这个 cacheEntry
 func (g *Group) populateCacheEntry(key string, entry cacheEntry) {
 	g.mainCache.add(key, entry)
@@ -383,6 +498,7 @@ func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, 
 	if err == nil {
 		// 从 peer 节点加载出了 key
 		g.stats.addPeerLoads(1)
+		g.bloomAdd(key)
 		// 重置熔断状态
 		g.onPeerSuccess(peerID)
 		return value, nil, true
@@ -425,6 +541,16 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	if g.closed.Load() {
 		return ByteView{}, ErrGroupClosed
 	}
+	if g.shouldRejectByBloom(key) {
+		g.stats.addBloomRejects(1)
+		if g.emptyTTL > 0 {
+			g.populateCacheEntry(key, cacheEntry{
+				negative:  true,
+				expiresAt: time.Now().Add(g.emptyTTL),
+			})
+		}
+		return ByteView{}, ErrNotFound
+	}
 	g.stats.addLocalLoads(1)
 	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {
@@ -438,6 +564,7 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	}
 	value := ByteView{b: cloneBytes(bytes)}
 	g.populateCache(key, value)
+	g.bloomAdd(key)
 	return value, nil
 }
 
@@ -458,6 +585,49 @@ func (g *Group) GetContext(ctx context.Context, key string) (ByteView, error) {
 func (g *Group) getLocallyContext(ctx context.Context, key string) (ByteView, error) {
 	return g.get(ctx, key, g.localLoader, g.getLocally)
 }
+
+func (g *Group) currentPeers() PeerPicker {
+	g.peersMu.RLock()
+	defer g.peersMu.RUnlock()
+	return g.peers
+}
+
+func (g *Group) broadcastInvalidate(ctx context.Context, key string, excludeAddrs ...string) error {
+	peers := g.currentPeers()
+	broadcaster, ok := peers.(mutationBroadcaster)
+	if !ok {
+		return nil
+	}
+
+	exclude := make(map[string]struct{}, len(excludeAddrs)+1)
+	exclude[broadcaster.Self()] = struct{}{}
+	for _, addr := range excludeAddrs {
+		if addr != "" {
+			exclude[addr] = struct{}{}
+		}
+	}
+
+	var errs []error
+	req := mutationRequest{Group: g.name, Key: key}
+	for _, peerSpec := range broadcaster.Peers() {
+		addr := parsePeerAddr(peerSpec)
+		if addr == "" {
+			continue
+		}
+		if _, skip := exclude[addr]; skip {
+			continue
+		}
+		peer, ok := broadcaster.PeerByAddr(addr)
+		if !ok {
+			continue
+		}
+		if err := peer.Invalidate(ctx, req); err != nil {
+			errs = append(errs, fmt.Errorf("invalidate %s: %w", addr, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (g *Group) startCleanup() {
 	g.cleanupMu.Lock()
 	defer g.cleanupMu.Unlock()

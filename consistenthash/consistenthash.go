@@ -17,6 +17,12 @@ type Map struct {
 	hashMap  map[int]string
 }
 
+// Member carries one physical node and its relative routing weight.
+type Member struct {
+	Node   string
+	Weight int
+}
+
 // New creates a Map instance
 // New 对每个新节点放 replicas 个虚拟节点, 放到哈希环上
 func New(replicas int, fn Hash) *Map {
@@ -33,11 +39,28 @@ func New(replicas int, fn Hash) *Map {
 
 // Add 先对业务key做哈希，然后在排好序的环上二分找到第一个大于它的位置，对应的那个节点就是负责这个 key 的节点
 func (m *Map) Add(keys ...string) {
+	members := make([]Member, 0, len(keys))
 	for _, key := range keys {
-		for i := 0; i < m.replicas; i++ {
-			hash := int(m.hash([]byte(strconv.Itoa(i) + key)))
+		members = append(members, Member{Node: key, Weight: 1})
+	}
+	m.AddMembers(members...)
+}
+
+// AddMembers adds one or more weighted members to the hash ring.
+func (m *Map) AddMembers(members ...Member) {
+	for _, member := range members {
+		if member.Node == "" {
+			continue
+		}
+		weight := member.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		replicas := m.replicas * weight
+		for i := 0; i < replicas; i++ {
+			hash := int(m.hash([]byte(strconv.Itoa(i) + member.Node)))
 			m.keys = append(m.keys, hash)
-			m.hashMap[hash] = key
+			m.hashMap[hash] = member.Node
 		}
 	}
 	sort.Ints(m.keys)

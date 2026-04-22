@@ -19,6 +19,7 @@ type cache struct {
 	shardCount int                 // 分片的实现
 	onExpire   func()              // 过期操作器
 	newEvictor func() algo.Evictor // 淘汰选取器
+	newStore   StoreFactory
 
 	mu     sync.RWMutex
 	shards []cacheShard
@@ -26,7 +27,7 @@ type cache struct {
 
 // Cache 分片
 type cacheShard struct {
-	store      *algo.Cache
+	store      Store
 	cacheBytes int64
 }
 
@@ -174,12 +175,16 @@ func (c *cache) effectiveShardCount() int {
 func (c *cache) initShards(shards []cacheShard) {
 	base := c.cacheBytes / int64(len(shards))
 	rem := c.cacheBytes % int64(len(shards))
+	factory := c.newStore
+	if factory == nil {
+		factory = newAlgoStore
+	}
 	for i := range shards {
 		shards[i].cacheBytes = base
 		if int64(i) < rem {
 			shards[i].cacheBytes++
 		}
-		shards[i].store = algo.New(shards[i].cacheBytes, c.evictor(), nil)
+		shards[i].store = factory(shards[i].cacheBytes, c.evictor(), nil)
 	}
 }
 

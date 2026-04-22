@@ -42,3 +42,28 @@ func TestHashing(t *testing.T) {
 	}
 
 }
+
+func TestWeightedMembersBiasOwnership(t *testing.T) {
+	hash := consistenthash.New(1, func(key []byte) uint32 {
+		i, _ := strconv.Atoi(string(key))
+		return uint32(i)
+	})
+
+	hash.AddMembers(
+		consistenthash.Member{Node: "2", Weight: 1},
+		consistenthash.Member{Node: "4", Weight: 2},
+	)
+
+	testCases := map[string]string{
+		"2":  "2",
+		"3":  "4",
+		"11": "4",
+		"15": "2",
+	}
+
+	for k, v := range testCases {
+		if got := hash.Get(k); got != v {
+			t.Fatalf("weighted hash ask %s, got %s want %s", k, got, v)
+		}
+	}
+}

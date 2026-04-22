@@ -121,6 +121,19 @@ func TestGRPCPoolPeersReflectLatestSet(t *testing.T) {
 	}
 }
 
+func TestGRPCPoolPeersKeepWeightSyntax(t *testing.T) {
+	pool := geecache.NewGRPCPool("self")
+	pool.Set("node1@2", "node2")
+
+	peers := pool.Peers()
+	sort.Strings(peers)
+
+	expect := []string{"node1@2", "node2"}
+	if !reflect.DeepEqual(expect, peers) {
+		t.Fatalf("expected weighted peers %v, got %v", expect, peers)
+	}
+}
+
 func TestGRPCGetterPropagatesPeerError(t *testing.T) {
 	groupName := "grpc-fetch-miss"
 	addr, cleanup := startTestGRPCServer(t, groupName, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
