@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"geecache/cluster"
 	"geecache/etcd/registry"
-	"log"
+	"geecache/internal/logx"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -32,6 +32,12 @@ func (p *Picker) fetchAllServices() (int64, error) {
 		members = append(members, member)
 	}
 	p.applyMembers(members)
+	logx.Event("etcd.discovery", "snapshot_loaded", map[string]interface{}{
+		"member_count": len(members),
+		"node":         p.self,
+		"revision":     revisionOf(resp),
+		"service":      p.serviceName,
+	})
 	if resp.Header == nil {
 		return 0, nil
 	}
@@ -46,7 +52,11 @@ func (p *Picker) watchServiceChanges(nextRev int64) {
 		if nextRev <= 0 {
 			rev, err := p.fetchAllServices()
 			if err != nil {
-				log.Printf("[EtcdPicker %s] discovery relist failed: %v", p.self, err)
+				logx.Event("etcd.discovery", "relist_failed", map[string]interface{}{
+					"error":   err,
+					"node":    p.self,
+					"service": p.serviceName,
+				})
 				if !p.sleepWithContext(p.discoveryRetryBackoff) {
 					return
 				}
@@ -63,9 +73,17 @@ func (p *Picker) watchServiceChanges(nextRev int64) {
 		case err == nil:
 			return
 		case errors.Is(err, errResync):
+			logx.Event("etcd.discovery", "resync_requested", map[string]interface{}{
+				"node":    p.self,
+				"service": p.serviceName,
+			})
 			nextRev = 0
 		default:
-			log.Printf("[EtcdPicker %s] discovery watch failed: %v", p.self, err)
+			logx.Event("etcd.discovery", "watch_failed", map[string]interface{}{
+				"error":   err,
+				"node":    p.self,
+				"service": p.serviceName,
+			})
 			nextRev = 0
 			if !p.sleepWithContext(p.discoveryRetryBackoff) {
 				return
@@ -75,6 +93,12 @@ func (p *Picker) watchServiceChanges(nextRev int64) {
 }
 
 func (p *Picker) watchFromRevision(startRev int64) error {
+	logx.Event("etcd.discovery", "watch_started", map[string]interface{}{
+		"node":      p.self,
+		"revision":  startRev,
+		"service":   p.serviceName,
+		"with_peer": len(p.Peers()),
+	})
 	watchCh := p.etcdCli.Watch(p.ctx, registry.ServicePrefix(p.serviceName), clientv3.WithPrefix(), clientv3.WithRev(startRev))
 
 	var ticker *time.Ticker
@@ -106,6 +130,13 @@ func (p *Picker) watchFromRevision(startRev int64) error {
 			startRev = resp.Header.Revision + 1
 		}
 	}
+}
+
+func revisionOf(resp *clientv3.GetResponse) int64 {
+	if resp == nil || resp.Header == nil {
+		return 0
+	}
+	return resp.Header.Revision
 }
 
 func (p *Picker) sleepWithContext(delay time.Duration) bool {

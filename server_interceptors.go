@@ -2,7 +2,7 @@ package geecache
 
 import (
 	"context"
-	"log"
+	"geecache/internal/logx"
 	"time"
 
 	"google.golang.org/grpc"
@@ -14,14 +14,21 @@ func loggingUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.Un
 	start := time.Now()
 	resp, err = handler(ctx, req)
 	code := status.Code(err)
-	log.Printf("[grpc] method=%s code=%s duration=%s", info.FullMethod, code.String(), time.Since(start))
+	logx.Event("grpc", "request", map[string]interface{}{
+		"code":     code.String(),
+		"duration": time.Since(start),
+		"method":   info.FullMethod,
+	})
 	return resp, err
 }
 
 func recoveryUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			log.Printf("[grpc] panic method=%s recovered=%v", info.FullMethod, recovered)
+			logx.Event("grpc", "panic", map[string]interface{}{
+				"method":    info.FullMethod,
+				"recovered": recovered,
+			})
 			err = status.Error(codes.Internal, "internal server error")
 		}
 	}()

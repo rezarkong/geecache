@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	pb "geecache/geecachepb"
+	"geecache/internal/logx"
 	"geecache/singleflight"
-	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -320,17 +320,31 @@ func (g *Group) get(ctx context.Context, key string, loader *singleflight.Group,
 	g.stats.addRequests(1)
 	// 如果在本地缓存中命中
 	if entry, ok := g.mainCache.get(key); ok {
-		log.Println("[GCache] hit")
 		g.stats.addCacheHits(1)
 		// 如果命中的是空缓存
 		if entry.negative {
 			g.stats.addEmptyHits(1)
+			logx.Event("cache", "empty_cache_hit", map[string]interface{}{
+				"group": g.name,
+				"key":   key,
+				"node":  g.nodeID(),
+			})
 			return ByteView{}, ErrNotFound
 		}
+		logx.Event("cache", "cache_hit", map[string]interface{}{
+			"group": g.name,
+			"key":   key,
+			"node":  g.nodeID(),
+		})
 		return entry.value, nil
 	}
 	// 本地 Cache 未命中
 	g.stats.addCacheMisses(1)
+	logx.Event("cache", "cache_miss", map[string]interface{}{
+		"group": g.name,
+		"key":   key,
+		"node":  g.nodeID(),
+	})
 	// 否则从其他节点获取或加载
 	return g.load(ctx, key, loader, loadFn)
 }
@@ -383,6 +397,45 @@ func (g *Group) pickPeer(key string) (PeerGetter, string, bool, bool) {
 		return nil, "", true, true
 	}
 	return peer, identifyPeer(peer), true, false
+}
+
+func (g *Group) nodeID() string {
+	type selfProvider interface {
+		Self() string
+	}
+	peers := g.currentPeers()
+	if provider, ok := peers.(selfProvider); ok {
+		if self := provider.Self(); self != "" {
+			return self
+		}
+	}
+	return "local"
+}
+
+func (g *Group) logQueryRoute(key string) {
+	_, peerID, ok, self := g.pickPeer(key)
+
+	owner := g.nodeID()
+	route := "local"
+	switch {
+	case ok && !self:
+		owner = peerID
+		route = "remote"
+	case ok && self:
+		route = "self"
+	default:
+		if owner != "local" {
+			route = "self"
+		}
+	}
+
+	logx.Event("cache", "query", map[string]interface{}{
+		"group": g.name,
+		"key":   key,
+		"node":  g.nodeID(),
+		"owner": owner,
+		"route": route,
+	})
 }
 
 // onPeerSuccess 某个 peer 请求成功后，重置这个 peer 的失败/熔断状态
@@ -490,9 +543,20 @@ func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, 
 	}
 	// 如果熔断了就报错
 	if !g.allowPeer(peerID) {
-		log.Println("[GCache] Skip peer because circuit is open", peerID)
+		logx.Event("cache", "peer_circuit_open", map[string]interface{}{
+			"group": g.name,
+			"key":   key,
+			"node":  g.nodeID(),
+			"peer":  peerID,
+		})
 		return ByteView{}, nil, false
 	}
+	logx.Event("cache", "peer_fetch_start", map[string]interface{}{
+		"group": g.name,
+		"key":   key,
+		"node":  g.nodeID(),
+		"peer":  peerID,
+	})
 	// 没有熔断就试图从 peer 节点取 key-val
 	value, err := g.getFromPeer(ctx, peer, key)
 	if err == nil {
@@ -501,6 +565,12 @@ func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, 
 		g.bloomAdd(key)
 		// 重置熔断状态
 		g.onPeerSuccess(peerID)
+		logx.Event("cache", "peer_fetch_success", map[string]interface{}{
+			"group": g.name,
+			"key":   key,
+			"node":  g.nodeID(),
+			"peer":  peerID,
+		})
 		return value, nil, true
 	}
 	// 如果是 空值缓存 同样相当于缓存调用到了
@@ -514,25 +584,50 @@ func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, error, 
 				expiresAt: time.Now().Add(g.emptyTTL),
 			})
 		}
+		logx.Event("cache", "peer_not_found", map[string]interface{}{
+			"empty_cache_written": g.emptyTTL > 0,
+			"group":               g.name,
+			"key":                 key,
+			"node":                g.nodeID(),
+			"peer":                peerID,
+		})
 		return ByteView{}, ErrNotFound, true
 	}
 	// Group 直接找不到
 	if errors.Is(err, ErrGroupNotFound) {
 		g.stats.addPeerFailures(1)
 		g.onPeerFailure(peerID)
-		log.Println("[GCache] Peer is missing group", err)
+		logx.Event("cache", "peer_group_missing", map[string]interface{}{
+			"error": err,
+			"group": g.name,
+			"key":   key,
+			"node":  g.nodeID(),
+			"peer":  peerID,
+		})
 		return ByteView{}, err, true
 	}
 	if errors.Is(err, ErrPeerViewMismatch) || errors.Is(err, ErrGroupClosed) {
 		g.stats.addPeerFailures(1)
 		g.onPeerFailure(peerID)
-		log.Println("[GCache] Peer rejected request", err)
+		logx.Event("cache", "peer_rejected", map[string]interface{}{
+			"error": err,
+			"group": g.name,
+			"key":   key,
+			"node":  g.nodeID(),
+			"peer":  peerID,
+		})
 		return ByteView{}, nil, false
 	}
 
 	g.stats.addPeerFailures(1)
 	g.onPeerFailure(peerID)
-	log.Println("[GCache] Failed to get from peer", err)
+	logx.Event("cache", "peer_fetch_failed", map[string]interface{}{
+		"error": err,
+		"group": g.name,
+		"key":   key,
+		"node":  g.nodeID(),
+		"peer":  peerID,
+	})
 	return ByteView{}, nil, false
 }
 
@@ -541,17 +636,37 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	if g.closed.Load() {
 		return ByteView{}, ErrGroupClosed
 	}
-	if g.shouldRejectByBloom(key) {
-		g.stats.addBloomRejects(1)
-		if g.emptyTTL > 0 {
-			g.populateCacheEntry(key, cacheEntry{
-				negative:  true,
-				expiresAt: time.Now().Add(g.emptyTTL),
+	if g.bloom != nil {
+		rejected := g.shouldRejectByBloom(key)
+		logx.Event("bloom", "check", map[string]interface{}{
+			"group":       g.name,
+			"intercepted": rejected,
+			"key":         key,
+			"node":        g.nodeID(),
+		})
+		if rejected {
+			g.stats.addBloomRejects(1)
+			if g.emptyTTL > 0 {
+				g.populateCacheEntry(key, cacheEntry{
+					negative:  true,
+					expiresAt: time.Now().Add(g.emptyTTL),
+				})
+			}
+			logx.Event("bloom", "reject", map[string]interface{}{
+				"empty_cache_written": g.emptyTTL > 0,
+				"group":               g.name,
+				"key":                 key,
+				"node":                g.nodeID(),
 			})
+			return ByteView{}, ErrNotFound
 		}
-		return ByteView{}, ErrNotFound
 	}
 	g.stats.addLocalLoads(1)
+	logx.Event("cache", "local_load_start", map[string]interface{}{
+		"group": g.name,
+		"key":   key,
+		"node":  g.nodeID(),
+	})
 	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) && g.emptyTTL > 0 {
@@ -560,11 +675,24 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 				expiresAt: time.Now().Add(g.emptyTTL),
 			})
 		}
+		logx.Event("cache", "local_load_failed", map[string]interface{}{
+			"empty_cache_written": errors.Is(err, ErrNotFound) && g.emptyTTL > 0,
+			"error":               err,
+			"group":               g.name,
+			"key":                 key,
+			"node":                g.nodeID(),
+		})
 		return ByteView{}, err
 	}
 	value := ByteView{b: cloneBytes(bytes)}
 	g.populateCache(key, value)
 	g.bloomAdd(key)
+	logx.Event("cache", "local_load_success", map[string]interface{}{
+		"bytes": len(bytes),
+		"group": g.name,
+		"key":   key,
+		"node":  g.nodeID(),
+	})
 	return value, nil
 }
 
@@ -578,6 +706,7 @@ func (g *Group) loadOnce(ctx context.Context, key string) (ByteView, error) {
 
 // GetContext 用 提供的 context 来获取 value 可以用于超时
 func (g *Group) GetContext(ctx context.Context, key string) (ByteView, error) {
+	g.logQueryRoute(key)
 	return g.get(ctx, key, g.loader, g.loadOnce)
 }
 

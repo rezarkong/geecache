@@ -3,7 +3,7 @@ package registry
 import (
 	"context"
 	"fmt"
-	"log"
+	"geecache/internal/logx"
 	"net"
 	"strings"
 	"sync"
@@ -88,6 +88,14 @@ func registerWithClient(cfg Config, addr string, cli etcdRegistrationClient) (*R
 		return nil, err
 	}
 	r.setLeaseID(leaseID)
+	logx.Event("etcd.registry", "registered", map[string]interface{}{
+		"addr":     advertiseAddr,
+		"key":      key,
+		"lease_id": leaseID,
+		"service":  cfg.ServiceName,
+		"ttl":      cfg.LeaseTTL,
+		"weight":   cfg.Weight,
+	})
 
 	go r.keepRegistered(keepAliveCh)
 	return r, nil
@@ -107,6 +115,10 @@ func (r *Registration) Close() error {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			_, err = r.cli.Revoke(ctx, leaseID)
 			cancel()
+			logx.Event("etcd.registry", "deregistered", map[string]interface{}{
+				"key":      r.key,
+				"lease_id": leaseID,
+			})
 		}
 		closeErr := r.cli.Close()
 		if err == nil {
@@ -154,6 +166,10 @@ func (r *Registration) keepRegistered(keepAliveCh <-chan *clientv3.LeaseKeepAliv
 			return
 		case resp, ok := <-current:
 			if !ok || resp == nil || resp.TTL <= 0 {
+				logx.Event("etcd.registry", "lease_lost", map[string]interface{}{
+					"key":      r.key,
+					"lease_id": r.currentLeaseID(),
+				})
 				r.setLeaseID(0)
 				current = nil
 			}
@@ -169,10 +185,17 @@ func (r *Registration) retryRegister() (<-chan *clientv3.LeaseKeepAliveResponse,
 
 		keepAliveCh, leaseID, err := r.registerOnce()
 		if err == nil {
+			logx.Event("etcd.registry", "re_registered", map[string]interface{}{
+				"key":      r.key,
+				"lease_id": leaseID,
+			})
 			return keepAliveCh, leaseID, nil
 		}
 
-		log.Printf("[registry] re-register %s failed: %v", r.key, err)
+		logx.Event("etcd.registry", "re_register_failed", map[string]interface{}{
+			"error": err,
+			"key":   r.key,
+		})
 		if !r.sleepWithContext(r.retryBackoff) {
 			return nil, 0, r.ctx.Err()
 		}

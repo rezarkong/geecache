@@ -6,6 +6,7 @@ import (
 	"geecache/cluster"
 	"geecache/consistenthash"
 	"geecache/etcd/registry"
+	"geecache/internal/logx"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -24,6 +25,13 @@ func (p *Picker) handleWatchEvents(events []*clientv3.Event) {
 		if member.Addr == "" || member.Addr == p.self {
 			continue
 		}
+		logx.Event("etcd.discovery", "watch_event", map[string]interface{}{
+			"member":  member.Addr,
+			"node":    p.self,
+			"service": p.serviceName,
+			"type":    event.Type.String(),
+			"weight":  member.Weight,
+		})
 		switch event.Type {
 		case clientv3.EventTypePut:
 			memberSet[member.Addr] = member
@@ -60,6 +68,10 @@ func (p *Picker) applyMembers(members []cluster.Member) {
 	ring.AddMembers(cluster.ToHashMembers(allMembers)...)
 
 	p.mu.Lock()
+	oldMembers := make(map[string]cluster.Member, len(p.members))
+	for addr, member := range p.members {
+		oldMembers[addr] = member
+	}
 	oldGetters := p.getters
 	nextGetters := make(map[string]cluster.ManagedPeer, len(unique))
 	for _, member := range allMembers {
@@ -84,11 +96,58 @@ func (p *Picker) applyMembers(members []cluster.Member) {
 	p.peers = ring
 	p.getters = nextGetters
 	p.peerView = cluster.NormalizePeerView(allMembers)
+	peerView := p.peerView
 	p.mu.Unlock()
 
 	for _, getter := range removed {
 		_ = getter.Close()
 	}
+
+	for addr, member := range unique {
+		if addr == p.self {
+			continue
+		}
+		old, existed := oldMembers[addr]
+		switch {
+		case !existed:
+			logx.Event("cluster", "peer_joined", map[string]interface{}{
+				"member":    member.Addr,
+				"node":      p.self,
+				"peer_view": peerView,
+				"service":   p.serviceName,
+				"weight":    member.Weight,
+			})
+		case old.Weight != member.Weight:
+			logx.Event("cluster", "peer_updated", map[string]interface{}{
+				"member":     member.Addr,
+				"node":       p.self,
+				"old_weight": old.Weight,
+				"peer_view":  peerView,
+				"service":    p.serviceName,
+				"weight":     member.Weight,
+			})
+		}
+	}
+	for addr, member := range oldMembers {
+		if addr == p.self {
+			continue
+		}
+		if _, ok := unique[addr]; !ok {
+			logx.Event("cluster", "peer_left", map[string]interface{}{
+				"member":    member.Addr,
+				"node":      p.self,
+				"peer_view": peerView,
+				"service":   p.serviceName,
+				"weight":    member.Weight,
+			})
+		}
+	}
+	logx.Event("cluster", "ring_rebuilt", map[string]interface{}{
+		"member_count": len(unique),
+		"node":         p.self,
+		"peer_view":    peerView,
+		"service":      p.serviceName,
+	})
 }
 
 func parseRegistryMember(service, key, raw string) (cluster.Member, bool) {

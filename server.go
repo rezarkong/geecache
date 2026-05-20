@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"geecache/consistenthash"
 	"geecache/etcd/registry"
+	"geecache/internal/logx"
 	"io"
 	"net"
 	"net/http"
@@ -238,6 +239,10 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("listen grpc on %s: %w", s.addr, err)
 	}
 	s.grpcListener = grpcListener
+	logx.Event("server", "grpc_listening", map[string]interface{}{
+		"addr":    grpcListener.Addr().String(),
+		"service": s.serviceName,
+	})
 
 	if s.apiServer != nil {
 		apiListener, err := net.Listen("tcp", s.apiServer.Addr)
@@ -247,6 +252,10 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("listen api on %s: %w", s.apiServer.Addr, err)
 		}
 		s.apiListener = apiListener
+		logx.Event("server", "api_listening", map[string]interface{}{
+			"addr":    apiListener.Addr().String(),
+			"service": s.serviceName,
+		})
 	}
 
 	if ctx != nil {
@@ -284,6 +293,13 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		s.registration = registration
 	}
+	logx.Event("server", "node_online", map[string]interface{}{
+		"api_addr":   listenerAddr(s.apiListener),
+		"grpc_addr":  s.GRPCAddr(),
+		"service":    s.serviceName,
+		"use_etcd":   s.useEtcd,
+		"peer_count": len(s.peerMgr.Peers()),
+	})
 
 	var firstErr error
 	for running > 0 {
@@ -311,6 +327,11 @@ func (s *Server) Close() error {
 	}
 
 	s.closeOnce.Do(func() {
+		logx.Event("server", "node_stopping", map[string]interface{}{
+			"api_addr":  listenerAddr(s.apiListener),
+			"grpc_addr": listenerAddr(s.grpcListener),
+			"service":   s.serviceName,
+		})
 		var errs []error
 
 		if s.registration != nil {
@@ -369,9 +390,21 @@ func (s *Server) Close() error {
 		}
 
 		s.closeErr = errors.Join(errs...)
+		logx.Event("server", "node_offline", map[string]interface{}{
+			"error":     s.closeErr,
+			"grpc_addr": s.addr,
+			"service":   s.serviceName,
+		})
 	})
 
 	return s.closeErr
+}
+
+func listenerAddr(listener net.Listener) string {
+	if listener == nil {
+		return ""
+	}
+	return listener.Addr().String()
 }
 
 // GRPCAddr returns the actual listening address after Run starts.

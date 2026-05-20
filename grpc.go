@@ -7,7 +7,7 @@ import (
 	"geecache/cluster"
 	"geecache/consistenthash"
 	pb "geecache/geecachepb"
-	"log"
+	"geecache/internal/logx"
 	"sort"
 	"sync"
 
@@ -55,7 +55,10 @@ func NewGRPCPoolWithOptions(self string, dialOptions []grpc.DialOption) *GRPCPoo
 
 // Log server 的日志
 func (p *GRPCPool) Log(format string, v ...interface{}) {
-	log.Printf("[Server %s] %s", p.self, fmt.Sprintf(format, v...))
+	logx.Event("peer.static", "message", map[string]interface{}{
+		"message": fmt.Sprintf(format, v...),
+		"node":    p.self,
+	})
 }
 
 // Set 更新 grpc pools 的 peer
@@ -91,6 +94,17 @@ func (p *GRPCPool) Set(peers ...string) {
 		p.members[peer.Addr] = peer
 	}
 	p.peerView = cluster.NormalizePeerView(weightedPeers)
+	peerSpecs := make([]string, 0, len(weightedPeers))
+	for _, peer := range weightedPeers {
+		peerSpecs = append(peerSpecs, cluster.FormatMemberSpec(peer))
+	}
+	sort.Strings(peerSpecs)
+	logx.Event("peer.static", "members_updated", map[string]interface{}{
+		"member_count": len(weightedPeers),
+		"node":         p.self,
+		"peer_view":    p.peerView,
+		"peers":        peerSpecs,
+	})
 }
 
 // Peers returns a copy of the current peer list.
@@ -114,9 +128,20 @@ func (p *GRPCPool) PickPeer(key string) (PeerGetter, bool, bool) {
 	}
 	if peer := p.peers.Get(key); peer != "" {
 		if peer == p.self {
+			logx.Event("peer.static", "owner_selected", map[string]interface{}{
+				"key":   key,
+				"node":  p.self,
+				"owner": p.self,
+				"self":  true,
+			})
 			return nil, true, true
 		}
-		p.Log("Pick peer %s", peer)
+		logx.Event("peer.static", "owner_selected", map[string]interface{}{
+			"key":   key,
+			"node":  p.self,
+			"owner": peer,
+			"self":  false,
+		})
 		return p.grpcGetters[peer], true, false
 	}
 	return nil, false, false
