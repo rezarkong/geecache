@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"geecache/consistenthash"
+	"geecache/etcd/registry"
 	"io"
 	"net"
 	"net/http"
 	"sync"
 	"time"
-
-	"geecache/registry"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -28,8 +28,30 @@ type peerConfigurator interface {
 	Set(peers ...string)
 }
 
+type hashInspector interface {
+	HashRingPositions() []consistenthash.RingPosition
+	LocateKey(key string) consistenthash.LookupResult
+}
+
 type peersPayload struct {
 	Peers []string `json:"peers"`
+}
+
+type hashRingPayload struct {
+	Peers     []string                      `json:"peers"`
+	Positions []consistenthash.RingPosition `json:"positions"`
+}
+
+type hashLookupPayload struct {
+	Peers  []string                    `json:"peers"`
+	Lookup consistenthash.LookupResult `json:"lookup"`
+}
+
+func writeJSON(w http.ResponseWriter, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	_ = encoder.Encode(payload)
 }
 
 // GroupManager keeps the groups served by one process together so the server
@@ -418,14 +440,12 @@ func newServerMux(group *Group, peers serverPeerManager) http.Handler {
 		_, _ = w.Write(view.ByteSlice())
 	}))
 	mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(group.Stats())
+		writeJSON(w, group.Stats())
 	}))
 	mux.Handle("/admin/peers", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(peersPayload{Peers: peers.Peers()})
+			writeJSON(w, peersPayload{Peers: peers.Peers()})
 		case http.MethodPost:
 			manager, ok := peers.(peerConfigurator)
 			if !ok {
@@ -447,11 +467,50 @@ func newServerMux(group *Group, peers serverPeerManager) http.Handler {
 				return
 			}
 			manager.Set(payload.Peers...)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(peersPayload{Peers: peers.Peers()})
+			writeJSON(w, peersPayload{Peers: peers.Peers()})
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+	}))
+	mux.Handle("/admin/hash/ring", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		inspector, ok := peers.(hashInspector)
+		if !ok {
+			http.Error(w, "hash inspection is unavailable", http.StatusConflict)
+			return
+		}
+		writeJSON(w, hashRingPayload{
+			Peers:     peers.Peers(),
+			Positions: inspector.HashRingPositions(),
+		})
+	}))
+	mux.Handle("/admin/hash/key", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, "key is required", http.StatusBadRequest)
+			return
+		}
+		inspector, ok := peers.(hashInspector)
+		if !ok {
+			http.Error(w, "hash inspection is unavailable", http.StatusConflict)
+			return
+		}
+		lookup := inspector.LocateKey(key)
+		if lookup.Owner == "" {
+			http.Error(w, "hash ring is empty", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, hashLookupPayload{
+			Peers:  peers.Peers(),
+			Lookup: lookup,
+		})
 	}))
 	return mux
 }

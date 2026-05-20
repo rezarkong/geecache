@@ -15,27 +15,34 @@
 
 ## 文档
 
-更详细的实现说明已经整理到 `./docs/doc`：
+更详细的实现说明已经整理到 `./docs`：
 
-- `docs/doc/README.md`：文档索引
-- `docs/doc/01-overview.md`：项目总览与技术栈
-- `docs/doc/02-request-flow.md`：一次 `Get` 的完整流程
-- `docs/doc/03-Cache-layer.md`：本地缓存与 TTL / shard 设计
-- `docs/doc/04-distributed-layer.md`：一致性哈希、gRPC、容错链路
-- `docs/doc/05-eviction-algorithms.md`：LRU / LFU / LRU-K / ARC
-- `docs/doc/06-testing-and-benchmark.md`：测试、benchmark、压测与亮点提炼
+- `docs/README.md`：文档总索引
+- `docs/architecture/`：架构与源码阅读文档
+- `docs/benchmarks/`：压测记录模板和性能材料
+- `docs/career/`：简历、面试表述材料
 
 ## 项目结构
 
+核心目录：
+
+- `algo/`：本地淘汰算法实现
+- `cmd/server/`：demo 节点启动入口和 MySQL 回源逻辑
+- `consistenthash/`：一致性哈希环
+- `registry/`：etcd 注册与服务记录
+- `singleflight/`：同 key 并发合并
+- `test/`：按主题拆分的集成测试与 benchmark
+
 核心文件：
 
-- `geecache.go`：`Group` 生命周期、缓存读取主链路、peer fallback、TTL 回填、显式失效
-- `Cache.go`：本地 shard Cache 封装、TTL 检查、后台清理入口
+- `groups.go`：`Group` 生命周期、缓存读取主链路、peer fallback、TTL 回填、显式失效
+- `cache.go`：本地 shard cache 封装、TTL 检查、后台清理入口
 - `grpc.go`：peer 选择、gRPC 服务端和客户端
+- `mutations.go`：集群写入、删除和失效同步
+- `server.go`：进程级 server、HTTP 管理接口和 peer 管理接入
 - `options.go`：缓存 TTL、空值缓存、shard、peer 重试、后台清理等配置项
 - `stats.go`：核心指标快照
-- `algo/`：本地淘汰算法实现
-- `cmd/server/main.go`：可运行的 demo 节点
+- `scripts/`：启动脚本、MySQL 初始化和压测脚本
 
 ## 当前能力
 
@@ -93,6 +100,23 @@ group := geecache.NewGroupWithOptions(
 
 - Go 1.24+
 - 本机可监听 `localhost:8001`、`localhost:8002`、`localhost:8003`、`localhost:9999`
+- 本机可访问 MySQL，且已初始化 `geecache.scores`
+
+MySQL 初始化：
+
+```bash
+mysql -u your_user -p < ./scripts/mysql_init.sql
+cp .env.example .env
+# 然后按你的实际账号密码修改 .env
+```
+
+默认表结构和示例数据：
+
+- 数据库：`geecache`
+- 表：`scores`
+- 主键列：`name`
+- 值列：`score`
+- 示例 key：`Tom`、`Jack`、`Sam`
 
 启动 3 个纯 gRPC Cache 节点：
 
@@ -118,6 +142,32 @@ make demo-node3
 make demo-api
 ```
 
+如果你想用一个脚本按端口启动 `etcd + gRPC + 布隆过滤器 + 空值缓存` 节点：
+
+```bash
+bash ./scripts/start_etcd_node.sh 8001
+bash ./scripts/start_etcd_node.sh 8002
+bash ./scripts/start_etcd_node.sh 8003
+```
+
+这个脚本会固定：
+
+- 打开 `-use-etcd=true`
+- 打开 HTTP API
+- API 端口 = 输入端口 `+1000`
+- 开启布隆过滤器和 `bloom-reject-on-miss`
+- 开启空值缓存
+
+默认值可以通过环境变量覆盖：
+
+```bash
+ETCD_ENDPOINTS=127.0.0.1:2379 \
+SERVICE_NAME=geecache \
+BLOOM_ITEMS=100000 \
+EMPTY_TTL=30s \
+bash ./scripts/start_etcd_node.sh 8001
+```
+
 请求示例：
 
 ```bash
@@ -125,6 +175,8 @@ curl "http://localhost:9999/api?key=Tom"
 curl "http://localhost:9999/api?key=unknown"
 curl "http://localhost:9999/metrics"
 curl "http://localhost:9999/admin/peers"
+curl "http://localhost:9999/admin/hash/ring"
+curl "http://localhost:9999/admin/hash/key?key=Tom"
 ```
 
 运行时更新 peer：

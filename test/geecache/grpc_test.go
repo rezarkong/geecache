@@ -74,6 +74,40 @@ func (g staticPeerGetter) Get(context.Context, *pb.Request, *pb.Response) error 
 	return g.err
 }
 
+type peerIdentifier interface {
+	ID() string
+}
+
+func pickedPeerID(t *testing.T, pool *geecache.GRPCPool, key string) string {
+	t.Helper()
+
+	getter, ok, self := pool.PickPeer(key)
+	if !ok {
+		t.Fatalf("expected key %q to have a peer assignment", key)
+	}
+	if self {
+		return "self"
+	}
+	named, ok := getter.(peerIdentifier)
+	if !ok {
+		t.Fatalf("expected peer getter for %q to expose ID()", key)
+	}
+	return named.ID()
+}
+
+func findKeyForPeer(t *testing.T, pool *geecache.GRPCPool, want string) string {
+	t.Helper()
+
+	for i := 0; i < 10000; i++ {
+		key := fmt.Sprintf("route-%d", i)
+		if got := pickedPeerID(t, pool, key); got == want {
+			return key
+		}
+	}
+	t.Fatalf("failed to find key routed to %s", want)
+	return ""
+}
+
 func TestGRPCGetterFetchesFromPeer(t *testing.T) {
 	groupName := "grpc-fetch"
 	addr, cleanup := startTestGRPCServer(t, groupName, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
@@ -118,6 +152,19 @@ func TestGRPCPoolPeersReflectLatestSet(t *testing.T) {
 	peers = pool.Peers()
 	if len(peers) != 1 || peers[0] != "node3" {
 		t.Fatalf("expected updated peers, got %v", peers)
+	}
+}
+
+func TestGRPCPoolPickPeerReflectsLatestSet(t *testing.T) {
+	pool := geecache.NewGRPCPool("self")
+	pool.Set("node1", "node2")
+
+	key := findKeyForPeer(t, pool, "node1")
+
+	pool.Set("node3")
+
+	if got := pickedPeerID(t, pool, key); got != "node3" {
+		t.Fatalf("expected key %q to route to node3 after Set, got %s", key, got)
 	}
 }
 

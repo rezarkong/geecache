@@ -39,7 +39,7 @@ type Registration struct {
 
 // Register registers addr under /services/<service>/<addr> and keeps the lease alive.
 func Register(cfg Config, addr string) (*Registration, error) {
-	cfg = normalizeConfig(cfg)
+	cfg = NormalizeConfig(cfg)
 
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   cfg.Endpoints,
@@ -53,15 +53,15 @@ func Register(cfg Config, addr string) (*Registration, error) {
 }
 
 func registerWithClient(cfg Config, addr string, cli etcdRegistrationClient) (*Registration, error) {
-	cfg = normalizeConfig(cfg)
+	cfg = NormalizeConfig(cfg)
 
-	advertiseAddr, err := normalizeAdvertiseAddr(addr)
+	advertiseAddr, err := NormalizeAdvertiseAddr(addr)
 	if err != nil {
 		_ = cli.Close()
 		return nil, err
 	}
 
-	key := serviceKey(cfg.ServiceName, advertiseAddr)
+	key := ServiceKey(cfg.ServiceName, advertiseAddr)
 	value, err := EncodeRecord(advertiseAddr, cfg.Weight)
 	if err != nil {
 		_ = cli.Close()
@@ -205,34 +205,7 @@ func (r *Registration) currentLeaseID() clientv3.LeaseID {
 	return r.leaseID
 }
 
-func normalizeConfig(cfg Config) Config {
-	if len(cfg.Endpoints) == 0 {
-		cfg.Endpoints = append([]string(nil), DefaultConfig.Endpoints...)
-	}
-	if cfg.DialTimeout <= 0 {
-		cfg.DialTimeout = DefaultConfig.DialTimeout
-	}
-	if cfg.ServiceName == "" {
-		cfg.ServiceName = DefaultConfig.ServiceName
-	}
-	if cfg.LeaseTTL <= 0 {
-		cfg.LeaseTTL = DefaultConfig.LeaseTTL
-	}
-	if cfg.RetryBackoff <= 0 {
-		cfg.RetryBackoff = DefaultConfig.RetryBackoff
-	}
-	return cfg
-}
-
-func servicePrefix(service string) string {
-	return fmt.Sprintf("/services/%s/", service)
-}
-
-func serviceKey(service, addr string) string {
-	return servicePrefix(service) + addr
-}
-
-func normalizeAdvertiseAddr(addr string) (string, error) {
+func NormalizeAdvertiseAddr(addr string) (string, error) {
 	if addr == "" {
 		return "", fmt.Errorf("empty address")
 	}

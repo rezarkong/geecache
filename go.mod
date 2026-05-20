@@ -1,20 +1,22 @@
 module geecache
 
-go 1.22
+go 1.24.0
 
 require google.golang.org/protobuf v1.36.5
 
 require (
+	github.com/go-sql-driver/mysql v1.10.0
+	go.etcd.io/etcd/api/v3 v3.5.18
 	go.etcd.io/etcd/client/v3 v3.5.18
 	google.golang.org/grpc v1.70.0
 )
 
 require (
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/coreos/go-semver v0.3.0 // indirect
 	github.com/coreos/go-systemd/v22 v22.3.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
-	go.etcd.io/etcd/api/v3 v3.5.18 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.18 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
 	go.uber.org/multierr v1.6.0 // indirect

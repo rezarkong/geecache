@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"geecache/cluster"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -18,23 +19,15 @@ const (
 	mutationInvalidateFullMethodName = "/" + mutationServiceName + "/Invalidate"
 )
 
-type mutationRequest struct {
-	Group string `json:"group,omitempty"`
-	Key   string `json:"key,omitempty"`
-	Value []byte `json:"value,omitempty"`
-}
+type mutationRequest = cluster.MutationRequest
 
 // MutationRequest exposes the cluster-mutation payload type for tests and callers
 // that want to integrate custom peer implementations.
-type MutationRequest = mutationRequest
+type MutationRequest = cluster.MutationRequest
 
 type mutationResponse struct{}
 
-type mutationPeer interface {
-	Set(ctx context.Context, req mutationRequest) error
-	Delete(ctx context.Context, req mutationRequest) error
-	Invalidate(ctx context.Context, req mutationRequest) error
-}
+type mutationPeer = cluster.MutationPeer
 
 type mutationService interface {
 	Set(context.Context, *mutationRequest) (*mutationResponse, error)
@@ -181,8 +174,7 @@ func withPeerView(ctx context.Context, view string) context.Context {
 }
 
 func parsePeerAddr(spec string) string {
-	peer := parsePeerSpec(spec)
-	return peer.Addr
+	return cluster.ParseMemberSpec(spec).Addr
 }
 
 func (g *Group) applySet(key string, value []byte) error {

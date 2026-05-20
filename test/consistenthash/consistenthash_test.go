@@ -67,3 +67,47 @@ func TestWeightedMembersBiasOwnership(t *testing.T) {
 		}
 	}
 }
+
+func TestPositionsAndLocateExposeRingState(t *testing.T) {
+	hash := consistenthash.New(1, func(key []byte) uint32 {
+		i, _ := strconv.Atoi(string(key))
+		return uint32(i)
+	})
+
+	hash.Add("6", "4", "2")
+
+	positions := hash.Positions()
+	if len(positions) != 3 {
+		t.Fatalf("expected 3 positions, got %d", len(positions))
+	}
+
+	wantPositions := []struct {
+		hash        int
+		node        string
+		replica     int
+		virtualNode string
+	}{
+		{2, "2", 0, "02"},
+		{4, "4", 0, "04"},
+		{6, "6", 0, "06"},
+	}
+	for i, want := range wantPositions {
+		got := positions[i]
+		if got.Hash != want.hash || got.Node != want.node || got.Replica != want.replica || got.VirtualNode != want.virtualNode {
+			t.Fatalf("position[%d]=%+v, want hash=%d node=%s replica=%d virtual=%s", i, got, want.hash, want.node, want.replica, want.virtualNode)
+		}
+	}
+
+	lookup := hash.Locate("5")
+	if lookup.Hash != 5 {
+		t.Fatalf("expected key hash 5, got %d", lookup.Hash)
+	}
+	if lookup.Owner != "6" || lookup.OwnerHash != 6 || lookup.OwnerReplica != 0 || lookup.OwnerVirtualNode != "06" || lookup.Wrapped {
+		t.Fatalf("unexpected lookup result: %+v", lookup)
+	}
+
+	wrapped := hash.Locate("7")
+	if wrapped.Hash != 7 || wrapped.Owner != "2" || wrapped.OwnerHash != 2 || !wrapped.Wrapped {
+		t.Fatalf("expected wrapped lookup to land on node 2, got %+v", wrapped)
+	}
+}

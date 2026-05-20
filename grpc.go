@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"geecache/cluster"
 	"geecache/consistenthash"
 	pb "geecache/geecachepb"
 	"log"
@@ -32,7 +33,7 @@ type GRPCPool struct {
 	mu          sync.RWMutex
 	peers       *consistenthash.Map
 	grpcGetters map[string]*grpcGetter
-	members     map[string]weightedPeer
+	members     map[string]cluster.Member
 	peerView    string
 }
 
@@ -62,10 +63,10 @@ func (p *GRPCPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	weightedPeers := uniqueWeightedPeers(peers)
+	weightedPeers := cluster.UniqueMembers(peers)
 	next := make(map[string]*grpcGetter, len(weightedPeers))
 	p.peers = consistenthash.New(defaultReplicas, nil)
-	p.peers.AddMembers(toHashMembers(weightedPeers)...)
+	p.peers.AddMembers(cluster.ToHashMembers(weightedPeers)...)
 	for _, peer := range weightedPeers {
 		if p.grpcGetters != nil {
 			if getter, ok := p.grpcGetters[peer.Addr]; ok {
@@ -85,11 +86,11 @@ func (p *GRPCPool) Set(peers ...string) {
 		}
 	}
 	p.grpcGetters = next
-	p.members = make(map[string]weightedPeer, len(weightedPeers))
+	p.members = make(map[string]cluster.Member, len(weightedPeers))
 	for _, peer := range weightedPeers {
 		p.members[peer.Addr] = peer
 	}
-	p.peerView = normalizePeerView(weightedPeers)
+	p.peerView = cluster.NormalizePeerView(weightedPeers)
 }
 
 // Peers returns a copy of the current peer list.
@@ -98,7 +99,7 @@ func (p *GRPCPool) Peers() []string {
 	defer p.mu.RUnlock()
 	peers := make([]string, 0, len(p.members))
 	for _, peer := range p.members {
-		peers = append(peers, formatPeerSpec(peer))
+		peers = append(peers, cluster.FormatMemberSpec(peer))
 	}
 	sort.Strings(peers)
 	return peers
@@ -158,6 +159,24 @@ func (p *GRPCPool) currentPeerView() string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.peerView
+}
+
+func (p *GRPCPool) HashRingPositions() []consistenthash.RingPosition {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.peers == nil {
+		return nil
+	}
+	return p.peers.Positions()
+}
+
+func (p *GRPCPool) LocateKey(key string) consistenthash.LookupResult {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.peers == nil {
+		return consistenthash.LookupResult{Key: key}
+	}
+	return p.peers.Locate(key)
 }
 
 var _ PeerPicker = (*GRPCPool)(nil)
@@ -278,6 +297,7 @@ func (h *grpcGetter) clientFor(ctx context.Context) (pb.GroupCacheClient, error)
 
 var _ PeerGetter = (*grpcGetter)(nil)
 var _ mutationPeer = (*grpcGetter)(nil)
+var _ cluster.ManagedPeer = (*grpcGetter)(nil)
 
 func (h *grpcGetter) invokeMutation(ctx context.Context, method string, req mutationRequest) error {
 	conn, err := h.connFor(ctx)

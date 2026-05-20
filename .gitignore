@@ -1,4 +1,5 @@
-/.idea
+.idea/
+.codex
 .env
-/docs
-Readme.md
+*.log
+.agents

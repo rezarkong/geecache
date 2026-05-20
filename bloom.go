@@ -101,6 +101,7 @@ func bloomHashes(key string) (uint64, uint64) {
 	h2 := fnv.New64()
 	_, _ = h2.Write([]byte(key))
 	sum2 := h2.Sum64()
+	// 防止 double hashing 退化
 	if sum2 == 0 {
 		sum2 = 0x9e3779b97f4a7c15
 	}

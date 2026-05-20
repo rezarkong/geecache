@@ -51,6 +51,46 @@ func (p flakyPeerPicker) Close() error {
 	return nil
 }
 
+type switchablePeerPicker struct {
+	mu     sync.RWMutex
+	getter geecache.PeerGetter
+	ok     bool
+	self   bool
+}
+
+func (p *switchablePeerPicker) PickPeer(string) (geecache.PeerGetter, bool, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.getter, p.ok, p.self
+}
+
+func (p *switchablePeerPicker) Close() error {
+	return nil
+}
+
+func (p *switchablePeerPicker) Set(getter geecache.PeerGetter, ok bool, self bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.getter = getter
+	p.ok = ok
+	p.self = self
+}
+
+type staticValuePeerGetter struct {
+	calls int32
+	value string
+	err   error
+}
+
+func (g *staticValuePeerGetter) Get(_ context.Context, _ *pb.Request, out *pb.Response) error {
+	atomic.AddInt32(&g.calls, 1)
+	if g.err != nil {
+		return g.err
+	}
+	out.Value = []byte(g.value)
+	return nil
+}
+
 type flakyPeerGetter struct {
 	failuresLeft int32
 	calls        int32
@@ -160,6 +200,58 @@ func TestGetFallsBackOnPeerFailure(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&loads); got != 1 {
 		t.Fatalf("expected local getter to run once, got %d", got)
+	}
+}
+
+func TestGroupSwitchesToLocalOwnerAfterPeerChange(t *testing.T) {
+	var localLoads int32
+	group := geecache.NewGroup("dynamic-owner-switch", 2<<10, geecache.GetterFunc(func(_ context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&localLoads, 1)
+		return []byte("local-" + key), nil
+	}))
+	defer group.Close()
+
+	remote := &staticValuePeerGetter{value: "peer-Tom"}
+	picker := &switchablePeerPicker{getter: remote, ok: true}
+	group.RegisterPeers(picker)
+
+	view, err := group.Get("Tom")
+	if err != nil {
+		t.Fatalf("Get from remote owner: %v", err)
+	}
+	if got := view.String(); got != "peer-Tom" {
+		t.Fatalf("expected remote owner value, got %q", got)
+	}
+	if got := atomic.LoadInt32(&localLoads); got != 0 {
+		t.Fatalf("expected no local load while peer owns key, got %d", got)
+	}
+
+	picker.Set(nil, true, true)
+
+	view, err = group.Get("Tom")
+	if err != nil {
+		t.Fatalf("Get after ownership moves local: %v", err)
+	}
+	if got := view.String(); got != "local-Tom" {
+		t.Fatalf("expected local owner value after peer change, got %q", got)
+	}
+	if got := atomic.LoadInt32(&localLoads); got != 1 {
+		t.Fatalf("expected one local reload after peer change, got %d", got)
+	}
+	if got := atomic.LoadInt32(&remote.calls); got != 1 {
+		t.Fatalf("expected one remote fetch before peer change, got %d", got)
+	}
+
+	if _, err := group.Get("Tom"); err != nil {
+		t.Fatalf("Get cached local value: %v", err)
+	}
+	if got := atomic.LoadInt32(&localLoads); got != 1 {
+		t.Fatalf("expected cached local owner value after first reload, got %d loads", got)
+	}
+
+	stats := group.Stats()
+	if stats.PeerLoads != 1 || stats.LocalLoads != 1 {
+		t.Fatalf("unexpected load counters after peer change: %+v", stats)
 	}
 }
 
